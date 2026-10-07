@@ -1,8 +1,4 @@
-use crate::media::{
-    player::MpvPlayer,
-    tracks::probe_audio_tracks,
-    video_surface::{VideoSurface, hwnd_from_handle},
-};
+use crate::media::{player::MpvPlayer, tracks::probe_audio_tracks};
 
 use eframe::egui;
 use std::{
@@ -30,7 +26,6 @@ pub struct SimpleMkvPlayer {
 
     player: MpvPlayer,
 
-    video_surface: Option<VideoSurface>,
     playing: bool,
     position: f64,
     duration: f64,
@@ -40,53 +35,18 @@ pub struct SimpleMkvPlayer {
 }
 
 impl SimpleMkvPlayer {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let mut player = MpvPlayer::new();
-
-        let mut status = "Open an MKV file.".to_string();
-
-        let video_surface = match hwnd_from_handle(cc) {
-            Ok(parent_hwnd) => match VideoSurface::new(parent_hwnd) {
-                Ok(surface) => {
-                    let child_hwnd = surface.hwnd() as isize;
-
-                    match player.set_video_hwnd(child_hwnd) {
-                        Ok(()) => Some(surface),
-
-                        Err(error) => {
-                            status = format!("libmpv video initialization failed: {error}");
-
-                            Some(surface)
-                        }
-                    }
-                }
-
-                Err(error) => {
-                    status = format!("Could not create native video surface: {error}");
-
-                    None
-                }
-            },
-
-            Err(error) => {
-                status = format!("Could not obtain application HWND: {error}");
-
-                None
-            }
-        };
-
+    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         Self {
             current_file: None,
             tracks: Vec::new(),
 
-            player,
-            video_surface,
+            player: MpvPlayer::new(),
 
             playing: false,
             position: 0.0,
             duration: 0.0,
 
-            status,
+            status: "Open an MKV file.".into(),
             last_poll: Instant::now(),
         }
     }
@@ -273,37 +233,18 @@ impl eframe::App for SimpleMkvPlayer {
         );
 
         ui.painter().rect_filled(rect, 4.0, egui::Color32::BLACK);
-        if self.current_file.is_none() {
-            ui.painter().text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                "Open an MKV file",
-                egui::FontId::proportional(20.0),
-                egui::Color32::GRAY,
-            );
-        }
 
-        // Keep the native Win32 video child aligned with the
-        // rectangle egui reserves for video.
-        if let Some(surface) = &self.video_surface {
-            let scale = ui.ctx().pixels_per_point();
-
-            let x = (rect.min.x * scale).round() as i32;
-
-            let y = (rect.min.y * scale).round() as i32;
-
-            let width = (rect.width() * scale).round() as i32;
-
-            let height = (rect.height() * scale).round() as i32;
-
-            surface.set_rect(x, y, width, height);
-
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
             if self.current_file.is_some() {
-                surface.show();
+                "Video is currently rendered by mpv"
             } else {
-                surface.hide();
-            }
-        }
+                "Open an MKV file"
+            },
+            egui::FontId::proportional(20.0),
+            egui::Color32::GRAY,
+        );
 
         ui.add_space(8.0);
 

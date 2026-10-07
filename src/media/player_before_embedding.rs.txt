@@ -21,13 +21,21 @@ type MpvGetProperty =
 type MpvSetProperty =
     unsafe extern "C" fn(*mut MpvHandle, *const c_char, c_int, *mut c_void) -> c_int;
 
-type MpvSetOptionString =
-    unsafe extern "C" fn(*mut MpvHandle, *const c_char, *const c_char) -> c_int;
-
 type MpvErrorString = unsafe extern "C" fn(c_int) -> *const c_char;
+
+// ------------------------------------------------------------
+// Values from mpv/client.h
+// ------------------------------------------------------------
 
 const MPV_FORMAT_FLAG: c_int = 3;
 const MPV_FORMAT_DOUBLE: c_int = 5;
+
+// ------------------------------------------------------------
+// Resolved libmpv API
+// ------------------------------------------------------------
+
+type MpvSetOptionString =
+    unsafe extern "C" fn(*mut MpvHandle, *const c_char, *const c_char) -> c_int;
 
 struct MpvApi {
     create: MpvCreate,
@@ -36,25 +44,38 @@ struct MpvApi {
     command: MpvCommand,
     get_property: MpvGetProperty,
     set_property: MpvSetProperty,
-    set_option_string: MpvSetOptionString,
     error_string: MpvErrorString,
+    set_option_string: MpvSetOptionString,
 }
+
+// ------------------------------------------------------------
+// Persistent player
+//
+// Field order matters:
+//
+// handle is destroyed manually before _library is dropped.
+// _library then keeps libmpv loaded for the entire lifetime
+// of the player.
+// ------------------------------------------------------------
 
 pub struct MpvPlayer {
     handle: *mut MpvHandle,
     api: MpvApi,
+
+    // Keep the DLL loaded while any function pointers or
+    // mpv handles are alive.
     _library: Library,
 
     loaded: bool,
-    initialized: bool,
 }
 
 impl MpvPlayer {
     pub fn new() -> Self {
         match Self::try_new() {
             Ok(player) => player,
+
             Err(error) => {
-                panic!("Could not create libmpv context: {error}");
+                panic!("Could not initialize libmpv: {error}");
             }
         }
     }
@@ -92,13 +113,12 @@ impl MpvPlayer {
                 .get::<MpvSetProperty>(b"mpv_set_property\0")
                 .map_err(|e| format!("Missing mpv_set_property: {e}"))?;
 
-            let set_option_string: MpvSetOptionString = *library
-                .get::<MpvSetOptionString>(b"mpv_set_option_string\0")
-                .map_err(|e| format!("Missing mpv_set_option_string: {e}"))?;
-
             let error_string: MpvErrorString = *library
                 .get::<MpvErrorString>(b"mpv_error_string\0")
                 .map_err(|e| format!("Missing mpv_error_string: {e}"))?;
+            let set_option_string: MpvSetOptionString = *library
+                .get::<MpvSetOptionString>(b"mpv_set_option_string\0")
+                .map_err(|e| format!("Missing mpv_set_option_string: {e}"))?;
 
             let api = MpvApi {
                 create,
@@ -107,8 +127,8 @@ impl MpvPlayer {
                 command,
                 get_property,
                 set_property,
-                set_option_string,
                 error_string,
+                set_option_string,
             };
 
             let handle = (api.create)();
@@ -117,86 +137,56 @@ impl MpvPlayer {
                 return Err("mpv_create() returned NULL.".into());
             }
 
-            // IMPORTANT:
+            // Initialize libmpv once.
             //
-            // Do NOT call mpv_initialize() yet.
-            //
-            // We need:
-            //
-            // mpv_create()
-            //     ?
-            // set wid = child HWND
-            //     ?
-            // mpv_initialize()
-            //
-            // That happens later in set_video_hwnd().
+            // Unlike our old backend, this mpv instance remains
+            // alive for the lifetime of the GUI.
+            let result = (api.initialize)(handle);
+
+            if result < 0 {
+                let message = Self::error_from_api(&api, result);
+
+                (api.terminate_destroy)(handle);
+
+                return Err(format!("mpv_initialize() failed: {message}"));
+            }
 
             Ok(Self {
                 handle,
                 api,
                 _library: library,
-
                 loaded: false,
-                initialized: false,
             })
         }
     }
 
-    pub fn set_video_hwnd(&mut self, hwnd: isize) -> Result<(), String> {
-        if self.handle.is_null() {
-            return Err("libmpv handle is NULL.".into());
-        }
-
-        if self.initialized {
-            return Ok(());
-        }
-
-        let option_name = CString::new("wid").unwrap();
-
-        let option_value = CString::new(hwnd.to_string())
-            .map_err(|_| "Could not encode HWND value.".to_string())?;
-
-        let result = unsafe {
-            (self.api.set_option_string)(self.handle, option_name.as_ptr(), option_value.as_ptr())
-        };
-
-        self.check(result, "set wid")?;
-
-        let result = unsafe { (self.api.initialize)(self.handle) };
-
-        if result < 0 {
-            return Err(format!(
-                "mpv_initialize() failed: {}",
-                Self::error_from_api(&self.api, result,)
-            ));
-        }
-
-        self.initialized = true;
-
-        Ok(())
-    }
+    // --------------------------------------------------------
+    // Load media into the EXISTING mpv context.
+    //
+    // No process is created.
+    // No named pipe is created.
+    // No new mpv context is created.
+    // --------------------------------------------------------
 
     pub fn load(&mut self, path: &Path) -> Result<(), String> {
-        if !self.initialized {
-            return Err("libmpv has not been initialized with a video HWND yet.".into());
-        }
-
         let path_string = path.to_string_lossy().into_owned();
 
         self.command(&["loadfile", &path_string, "replace"])?;
 
         self.loaded = true;
 
+        // Match our previous behavior: newly opened files start
+        // paused.
         self.set_paused(true)?;
 
         Ok(())
     }
 
-    pub fn set_paused(&self, paused: bool) -> Result<(), String> {
-        if !self.initialized {
-            return Err("libmpv is not initialized.".into());
-        }
+    // --------------------------------------------------------
+    // Playback controls
+    // --------------------------------------------------------
 
+    pub fn set_paused(&self, paused: bool) -> Result<(), String> {
         let name = CString::new("pause").unwrap();
 
         let mut value: c_int = if paused { 1 } else { 0 };
@@ -214,10 +204,6 @@ impl MpvPlayer {
     }
 
     pub fn paused(&self) -> Result<bool, String> {
-        if !self.initialized {
-            return Err("libmpv is not initialized.".into());
-        }
-
         let name = CString::new("pause").unwrap();
 
         let mut value: c_int = 0;
@@ -250,8 +236,15 @@ impl MpvPlayer {
         self.command(&["seek", &seconds_string, "absolute+exact"])
     }
 
+    // --------------------------------------------------------
+    // Stop current media WITHOUT destroying libmpv.
+    //
+    // This is the important difference from our IPC backend.
+    // The libmpv context stays alive and can load another MKV.
+    // --------------------------------------------------------
+
     pub fn stop(&mut self) {
-        if self.loaded && self.initialized && !self.handle.is_null() {
+        if self.loaded && !self.handle.is_null() {
             let _ = self.command(&["stop"]);
         }
 
@@ -259,14 +252,14 @@ impl MpvPlayer {
     }
 
     pub fn is_running(&mut self) -> bool {
-        self.loaded && self.initialized && !self.handle.is_null()
+        self.loaded && !self.handle.is_null()
     }
 
-    fn command(&self, args: &[&str]) -> Result<(), String> {
-        if !self.initialized {
-            return Err("libmpv is not initialized.".into());
-        }
+    // --------------------------------------------------------
+    // Generic command helper
+    // --------------------------------------------------------
 
+    fn command(&self, args: &[&str]) -> Result<(), String> {
         if self.handle.is_null() {
             return Err("libmpv handle is NULL.".into());
         }
@@ -281,6 +274,7 @@ impl MpvPlayer {
 
         let mut pointers: Vec<*const c_char> = strings.iter().map(|value| value.as_ptr()).collect();
 
+        // mpv_command requires a NULL-terminated argv array.
         pointers.push(ptr::null());
 
         let result = unsafe { (self.api.command)(self.handle, pointers.as_ptr()) };
@@ -288,11 +282,11 @@ impl MpvPlayer {
         self.check(result, args.first().copied().unwrap_or("command"))
     }
 
-    fn get_double_property(&self, property: &str) -> Result<f64, String> {
-        if !self.initialized {
-            return Err("libmpv is not initialized.".into());
-        }
+    // --------------------------------------------------------
+    // Property helper
+    // --------------------------------------------------------
 
+    fn get_double_property(&self, property: &str) -> Result<f64, String> {
         let name =
             CString::new(property).map_err(|_| format!("Invalid mpv property name: {property}"))?;
 
@@ -311,6 +305,10 @@ impl MpvPlayer {
 
         Ok(value)
     }
+
+    // --------------------------------------------------------
+    // Error handling
+    // --------------------------------------------------------
 
     fn check(&self, result: c_int, operation: &str) -> Result<(), String> {
         if result >= 0 {
@@ -335,6 +333,10 @@ impl MpvPlayer {
         }
     }
 
+    // --------------------------------------------------------
+    // Vendored DLL location
+    // --------------------------------------------------------
+
     fn dll_path() -> Result<PathBuf, String> {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("vendor")
@@ -348,6 +350,13 @@ impl MpvPlayer {
         Ok(path)
     }
 }
+
+// ------------------------------------------------------------
+// Destroy the persistent mpv context exactly once.
+//
+// Because _library is a field on MpvPlayer, the DLL remains
+// loaded until AFTER this Drop implementation completes.
+// ------------------------------------------------------------
 
 impl Drop for MpvPlayer {
     fn drop(&mut self) {
