@@ -1,6 +1,13 @@
-use crate::media::tracks::probe_audio_tracks;
+use crate::media::{
+    player::MpvPlayer,
+    tracks::probe_audio_tracks,
+};
+
 use eframe::egui;
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 pub struct AudioTrack {
     pub number: usize,
@@ -19,9 +26,15 @@ pub struct AudioTrack {
 pub struct SimpleMkvPlayer {
     current_file: Option<PathBuf>,
     tracks: Vec<AudioTrack>,
+
+    player: MpvPlayer,
+
     playing: bool,
-    position: f32,
+    position: f64,
+    duration: f64,
+
     status: String,
+    last_poll: Instant,
 }
 
 impl SimpleMkvPlayer {
@@ -29,9 +42,15 @@ impl SimpleMkvPlayer {
         Self {
             current_file: None,
             tracks: Vec::new(),
+
+            player: MpvPlayer::new(),
+
             playing: false,
             position: 0.0,
+            duration: 0.0,
+
             status: "Open an MKV file.".into(),
+            last_poll: Instant::now(),
         }
     }
 
@@ -46,8 +65,14 @@ impl SimpleMkvPlayer {
 
         self.current_file = Some(path.clone());
         self.tracks.clear();
+
         self.playing = false;
         self.position = 0.0;
+        self.duration = 0.0;
+
+        // -----------------------------------------------
+        // Detect real audio streams
+        // -----------------------------------------------
 
         match probe_audio_tracks(&path) {
             Ok(detected) => {
@@ -64,30 +89,129 @@ impl SimpleMkvPlayer {
                         channels: track.channels,
                         channel_layout: track.channel_layout,
                         language: track.language,
-
-                        // Start everything enabled for now.
-                        // Once the real mixer exists, these become live controls.
                         enabled: true,
                         volume: 1.0,
                     })
                     .collect();
-
-                self.status = format!(
-                    "Detected {} audio track{}.",
-                    self.tracks.len(),
-                    if self.tracks.len() == 1 { "" } else { "s" }
-                );
             }
 
             Err(error) => {
-                self.status = error;
+                self.status = format!(
+                    "Audio probe failed: {error}"
+                );
+            }
+        }
+
+        // -----------------------------------------------
+        // Start mpv
+        // -----------------------------------------------
+
+        match self.player.load(&path) {
+            Ok(()) => {
+                self.status = format!(
+                    "Loaded video with {} audio track{}.",
+                    self.tracks.len(),
+                    if self.tracks.len() == 1 { "" } else { "s" }
+                );
+
+                // Give mpv a brief chance to finish loading metadata.
+                std::thread::sleep(Duration::from_millis(100));
+
+                self.duration =
+                    self.player.duration().unwrap_or(0.0);
+
+                self.position =
+                    self.player.position().unwrap_or(0.0);
+
+                self.playing = !self.player.paused().unwrap_or(true);
+            }
+
+            Err(error) => {
+                self.status = format!(
+                    "Playback error: {error}"
+                );
+            }
+        }
+    }
+
+    fn poll_player(&mut self) {
+        if self.last_poll.elapsed() < Duration::from_millis(250) {
+            return;
+        }
+
+        self.last_poll = Instant::now();
+
+        if !self.player.is_running() {
+            self.playing = false;
+            return;
+        }
+
+        if let Ok(position) = self.player.position() {
+            self.position = position;
+        }
+
+        if let Ok(duration) = self.player.duration() {
+            self.duration = duration;
+        }
+
+        if let Ok(paused) = self.player.paused() {
+            self.playing = !paused;
+        }
+    }
+
+    fn toggle_playback(&mut self) {
+        if !self.player.is_running() {
+            return;
+        }
+
+        let new_playing = !self.playing;
+
+        match self.player.set_paused(!new_playing) {
+            Ok(()) => {
+                self.playing = new_playing;
+            }
+
+            Err(error) => {
+                self.status = format!(
+                    "Playback control error: {error}"
+                );
             }
         }
     }
 }
 
+fn format_time(seconds: f64) -> String {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return "00:00".into();
+    }
+
+    let total = seconds.round() as u64;
+
+    let hours = total / 3600;
+    let minutes = (total % 3600) / 60;
+    let seconds = total % 60;
+
+    if hours > 0 {
+        format!("{hours:02}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}")
+    }
+}
+
 impl eframe::App for SimpleMkvPlayer {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        _frame: &mut eframe::Frame,
+    ) {
+        self.poll_player();
+
+        // Keep refreshing while playback is active.
+        if self.playing {
+            ui.ctx()
+                .request_repaint_after(Duration::from_millis(100));
+        }
+
         // ----------------------------------------------------
         // TOP BAR
         // ----------------------------------------------------
@@ -114,15 +238,22 @@ impl eframe::App for SimpleMkvPlayer {
 
         // ----------------------------------------------------
         // VIDEO PLACEHOLDER
+        //
+        // mpv is deliberately in its own window for this
+        // milestone. Embedding comes next.
         // ----------------------------------------------------
 
         let available_width = ui.available_width();
 
-        let video_height = (available_width * 9.0 / 16.0)
-            .min(ui.available_height() * 0.55);
+        let video_height =
+            (available_width * 9.0 / 16.0)
+                .min(ui.available_height() * 0.55);
 
         let (rect, _) = ui.allocate_exact_size(
-            egui::vec2(available_width, video_height),
+            egui::vec2(
+                available_width,
+                video_height,
+            ),
             egui::Sense::hover(),
         );
 
@@ -136,7 +267,7 @@ impl eframe::App for SimpleMkvPlayer {
             rect.center(),
             egui::Align2::CENTER_CENTER,
             if self.current_file.is_some() {
-                "Video output"
+                "Video is currently rendered by mpv"
             } else {
                 "Open an MKV file"
             },
@@ -147,29 +278,61 @@ impl eframe::App for SimpleMkvPlayer {
         ui.add_space(8.0);
 
         // ----------------------------------------------------
-        // PLAYBACK PLACEHOLDER
+        // REAL PLAYBACK CONTROLS
         // ----------------------------------------------------
 
         ui.horizontal(|ui| {
-            let button_text = if self.playing {
-                "Pause"
-            } else {
-                "Play"
-            };
+            let button_text =
+                if self.playing { "Pause" } else { "Play" };
 
             if ui.button(button_text).clicked() {
-                self.playing = !self.playing;
+                self.toggle_playback();
             }
 
-            ui.add(
+            let max_duration =
+                if self.duration > 0.0 {
+                    self.duration
+                } else {
+                    1.0
+                };
+
+            let mut slider_position =
+                self.position.clamp(0.0, max_duration);
+
+            let slider_response = ui.add(
                 egui::Slider::new(
-                    &mut self.position,
-                    0.0..=100.0,
+                    &mut slider_position,
+                    0.0..=max_duration,
                 )
                 .show_value(false),
             );
 
-            ui.label(format!("{:.0}%", self.position));
+            if slider_response.changed() {
+                self.position = slider_position;
+            }
+
+            if slider_response.drag_stopped() {
+                match self
+                    .player
+                    .seek_absolute(slider_position)
+                {
+                    Ok(()) => {
+                        self.position = slider_position;
+                    }
+
+                    Err(error) => {
+                        self.status = format!(
+                            "Seek error: {error}"
+                        );
+                    }
+                }
+            }
+
+            ui.label(format!(
+                "{} / {}",
+                format_time(self.position),
+                format_time(self.duration)
+            ));
         });
 
         ui.separator();
@@ -184,14 +347,19 @@ impl eframe::App for SimpleMkvPlayer {
 
         ui.add_space(5.0);
 
-        if self.tracks.is_empty() && self.current_file.is_some() {
+        if self.tracks.is_empty()
+            && self.current_file.is_some()
+        {
             ui.label("No audio streams detected.");
         }
 
         for track in &mut self.tracks {
             ui.group(|ui| {
                 ui.horizontal(|ui| {
-                    ui.checkbox(&mut track.enabled, "");
+                    ui.checkbox(
+                        &mut track.enabled,
+                        "",
+                    );
 
                     ui.strong(format!(
                         "Track {}",
@@ -216,7 +384,10 @@ impl eframe::App for SimpleMkvPlayer {
                         track.volume * 100.0
                     ));
 
-                    if ui.button("Export WAV").clicked() {
+                    if ui
+                        .button("Export WAV")
+                        .clicked()
+                    {
                         println!(
                             "Export requested: audio stream {}",
                             track.audio_index
@@ -234,7 +405,9 @@ impl eframe::App for SimpleMkvPlayer {
 
                     ui.separator();
 
-                    if let Some(rate) = track.sample_rate {
+                    if let Some(rate) =
+                        track.sample_rate
+                    {
                         if rate % 1000 == 0 {
                             ui.label(format!(
                                 "{} kHz",
@@ -250,19 +423,26 @@ impl eframe::App for SimpleMkvPlayer {
                         ui.separator();
                     }
 
-                    if let Some(channels) = track.channels {
-                        let channel_text = match channels {
-                            1 => "Mono".to_string(),
-                            2 => "Stereo".to_string(),
-                            _ => format!("{} channels", channels),
-                        };
+                    if let Some(channels) =
+                        track.channels
+                    {
+                        let channel_text =
+                            match channels {
+                                1 => "Mono".to_string(),
+                                2 => "Stereo".to_string(),
+                                _ => format!(
+                                    "{} channels",
+                                    channels
+                                ),
+                            };
 
                         ui.label(channel_text);
-
                         ui.separator();
                     }
 
-                    if let Some(layout) = &track.channel_layout {
+                    if let Some(layout) =
+                        &track.channel_layout
+                    {
                         ui.label(format!(
                             "Layout: {}",
                             layout
@@ -276,7 +456,9 @@ impl eframe::App for SimpleMkvPlayer {
                         track.stream_index
                     ));
 
-                    if let Some(language) = &track.language {
+                    if let Some(language) =
+                        &track.language
+                    {
                         ui.separator();
 
                         ui.label(format!(
@@ -293,7 +475,10 @@ impl eframe::App for SimpleMkvPlayer {
         if !self.tracks.is_empty() {
             ui.add_space(5.0);
 
-            if ui.button("Export All Tracks").clicked() {
+            if ui
+                .button("Export All Tracks")
+                .clicked()
+            {
                 println!("Export all requested");
             }
         }
