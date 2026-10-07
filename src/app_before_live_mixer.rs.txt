@@ -1,12 +1,10 @@
 use crate::media::{
-    audio_mixer::{AudioMixer, MixTrackConfig},
     player::MpvPlayer,
     tracks::probe_audio_tracks,
     video_surface::{VideoSurface, hwnd_from_handle},
 };
 
 use eframe::egui;
-
 use std::{
     path::PathBuf,
     time::{Duration, Instant},
@@ -31,10 +29,8 @@ pub struct SimpleMkvPlayer {
     tracks: Vec<AudioTrack>,
 
     player: MpvPlayer,
+
     video_surface: Option<VideoSurface>,
-
-    audio_mixer: Option<AudioMixer>,
-
     playing: bool,
     position: f64,
     duration: f64,
@@ -52,13 +48,13 @@ impl SimpleMkvPlayer {
         let video_surface = match hwnd_from_handle(cc) {
             Ok(parent_hwnd) => match VideoSurface::new(parent_hwnd) {
                 Ok(surface) => {
-                    let hwnd = surface.hwnd() as isize;
+                    let child_hwnd = surface.hwnd() as isize;
 
-                    match player.set_video_hwnd(hwnd) {
+                    match player.set_video_hwnd(child_hwnd) {
                         Ok(()) => Some(surface),
 
                         Err(error) => {
-                            status = format!("Video initialization failed: {error}");
+                            status = format!("libmpv video initialization failed: {error}");
 
                             Some(surface)
                         }
@@ -66,7 +62,7 @@ impl SimpleMkvPlayer {
                 }
 
                 Err(error) => {
-                    status = format!("Could not create video surface: {error}");
+                    status = format!("Could not create native video surface: {error}");
 
                     None
                 }
@@ -79,23 +75,12 @@ impl SimpleMkvPlayer {
             }
         };
 
-        let audio_mixer = match AudioMixer::new() {
-            Ok(mixer) => Some(mixer),
-
-            Err(error) => {
-                status = format!("Audio mixer initialization failed: {error}");
-
-                None
-            }
-        };
-
         Self {
             current_file: None,
             tracks: Vec::new(),
 
             player,
             video_surface,
-            audio_mixer,
 
             playing: false,
             position: 0.0,
@@ -103,39 +88,6 @@ impl SimpleMkvPlayer {
 
             status,
             last_poll: Instant::now(),
-        }
-    }
-
-    fn mix_configs(&self) -> Vec<MixTrackConfig> {
-        self.tracks
-            .iter()
-            .map(|track| MixTrackConfig {
-                audio_index: track.audio_index,
-
-                volume: track.volume,
-
-                enabled: track.enabled,
-            })
-            .collect()
-    }
-
-    fn start_mixer_at(&mut self, seconds: f64) -> Result<(), String> {
-        let Some(path) = self.current_file.clone() else {
-            return Err("No media file loaded.".into());
-        };
-
-        let configs = self.mix_configs();
-
-        let Some(mixer) = self.audio_mixer.as_mut() else {
-            return Err("Audio mixer unavailable.".into());
-        };
-
-        mixer.start_mix(&path, &configs, seconds)
-    }
-
-    fn stop_mixer(&mut self) {
-        if let Some(mixer) = self.audio_mixer.as_mut() {
-            mixer.stop_all();
         }
     }
 
@@ -148,47 +100,34 @@ impl SimpleMkvPlayer {
             return;
         };
 
-        self.stop_mixer();
-
         self.current_file = Some(path.clone());
-
         self.tracks.clear();
 
         self.playing = false;
         self.position = 0.0;
         self.duration = 0.0;
 
+        // -----------------------------------------------
+        // Detect real audio streams
+        // -----------------------------------------------
+
         match probe_audio_tracks(&path) {
             Ok(detected) => {
                 self.tracks = detected
                     .into_iter()
                     .enumerate()
-                    .map(|(i, track)| {
-                        AudioTrack {
-                            number: i + 1,
-
-                            audio_index: track.audio_index,
-
-                            stream_index: track.stream_index,
-
-                            name: track.title,
-
-                            codec: track.codec,
-
-                            sample_rate: track.sample_rate,
-
-                            channels: track.channels,
-
-                            channel_layout: track.channel_layout,
-
-                            language: track.language,
-
-                            // Start like a conventional player.
-                            // OBS combined mix = Track 1.
-                            enabled: i == 0,
-
-                            volume: 1.0,
-                        }
+                    .map(|(i, track)| AudioTrack {
+                        number: i + 1,
+                        audio_index: track.audio_index,
+                        stream_index: track.stream_index,
+                        name: track.title,
+                        codec: track.codec,
+                        sample_rate: track.sample_rate,
+                        channels: track.channels,
+                        channel_layout: track.channel_layout,
+                        language: track.language,
+                        enabled: true,
+                        volume: 1.0,
                     })
                     .collect();
             }
@@ -198,6 +137,10 @@ impl SimpleMkvPlayer {
             }
         }
 
+        // -----------------------------------------------
+        // Start mpv
+        // -----------------------------------------------
+
         match self.player.load(&path) {
             Ok(()) => {
                 self.status = format!(
@@ -206,6 +149,7 @@ impl SimpleMkvPlayer {
                     if self.tracks.len() == 1 { "" } else { "s" }
                 );
 
+                // Give mpv a brief chance to finish loading metadata.
                 std::thread::sleep(Duration::from_millis(100));
 
                 self.duration = self.player.duration().unwrap_or(0.0);
@@ -229,10 +173,6 @@ impl SimpleMkvPlayer {
         self.last_poll = Instant::now();
 
         if !self.player.is_running() {
-            if self.playing {
-                self.stop_mixer();
-            }
-
             self.playing = false;
             return;
         }
@@ -255,94 +195,15 @@ impl SimpleMkvPlayer {
             return;
         }
 
-        // ----------------------------
-        // PAUSE
-        // ----------------------------
+        let new_playing = !self.playing;
 
-        if self.playing {
-            match self.player.set_paused(true) {
-                Ok(()) => {
-                    self.stop_mixer();
-                    self.playing = false;
-                }
-
-                Err(error) => {
-                    self.status = format!("Playback control error: {error}");
-                }
-            }
-
-            return;
-        }
-
-        // ----------------------------
-        // PLAY
-        // ----------------------------
-
-        let start = self.position;
-
-        if let Err(error) = self.start_mixer_at(start) {
-            self.status = format!("Audio playback error: {error}");
-
-            return;
-        }
-
-        match self.player.set_paused(false) {
+        match self.player.set_paused(!new_playing) {
             Ok(()) => {
-                self.playing = true;
+                self.playing = new_playing;
             }
 
             Err(error) => {
-                self.stop_mixer();
-
                 self.status = format!("Playback control error: {error}");
-            }
-        }
-    }
-
-    fn seek_to(&mut self, seconds: f64) {
-        let seconds = seconds.max(0.0);
-
-        let was_playing = self.playing;
-
-        if was_playing {
-            let _ = self.player.set_paused(true);
-
-            self.stop_mixer();
-        }
-
-        match self.player.seek_absolute(seconds) {
-            Ok(()) => {
-                self.position = seconds;
-            }
-
-            Err(error) => {
-                self.status = format!("Seek error: {error}");
-
-                if was_playing {
-                    let _ = self.player.set_paused(false);
-                }
-
-                return;
-            }
-        }
-
-        if was_playing {
-            match self.start_mixer_at(seconds) {
-                Ok(()) => {
-                    if let Err(error) = self.player.set_paused(false) {
-                        self.stop_mixer();
-
-                        self.playing = false;
-
-                        self.status = format!("Playback control error: {error}");
-                    }
-                }
-
-                Err(error) => {
-                    self.playing = false;
-
-                    self.status = format!("Audio seek error: {error}");
-                }
             }
         }
     }
@@ -356,9 +217,7 @@ fn format_time(seconds: f64) -> String {
     let total = seconds.round() as u64;
 
     let hours = total / 3600;
-
     let minutes = (total % 3600) / 60;
-
     let seconds = total % 60;
 
     if hours > 0 {
@@ -372,13 +231,14 @@ impl eframe::App for SimpleMkvPlayer {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_player();
 
+        // Keep refreshing while playback is active.
         if self.playing {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
 
-        // ====================================================
+        // ----------------------------------------------------
         // TOP BAR
-        // ====================================================
+        // ----------------------------------------------------
 
         ui.horizontal(|ui| {
             if ui.button("Open MKV").clicked() {
@@ -396,9 +256,12 @@ impl eframe::App for SimpleMkvPlayer {
 
         ui.separator();
 
-        // ====================================================
-        // VIDEO
-        // ====================================================
+        // ----------------------------------------------------
+        // VIDEO PLACEHOLDER
+        //
+        // mpv is deliberately in its own window for this
+        // milestone. Embedding comes next.
+        // ----------------------------------------------------
 
         let available_width = ui.available_width();
 
@@ -410,7 +273,6 @@ impl eframe::App for SimpleMkvPlayer {
         );
 
         ui.painter().rect_filled(rect, 4.0, egui::Color32::BLACK);
-
         if self.current_file.is_none() {
             ui.painter().text(
                 rect.center(),
@@ -421,6 +283,8 @@ impl eframe::App for SimpleMkvPlayer {
             );
         }
 
+        // Keep the native Win32 video child aligned with the
+        // rectangle egui reserves for video.
         if let Some(surface) = &self.video_surface {
             let scale = ui.ctx().pixels_per_point();
 
@@ -443,9 +307,9 @@ impl eframe::App for SimpleMkvPlayer {
 
         ui.add_space(8.0);
 
-        // ====================================================
-        // PLAYBACK
-        // ====================================================
+        // ----------------------------------------------------
+        // REAL PLAYBACK CONTROLS
+        // ----------------------------------------------------
 
         ui.horizontal(|ui| {
             let button_text = if self.playing { "Pause" } else { "Play" };
@@ -462,15 +326,23 @@ impl eframe::App for SimpleMkvPlayer {
 
             let mut slider_position = self.position.clamp(0.0, max_duration);
 
-            let slider = ui
+            let slider_response = ui
                 .add(egui::Slider::new(&mut slider_position, 0.0..=max_duration).show_value(false));
 
-            if slider.changed() {
+            if slider_response.changed() {
                 self.position = slider_position;
             }
 
-            if slider.drag_stopped() {
-                self.seek_to(slider_position);
+            if slider_response.drag_stopped() {
+                match self.player.seek_absolute(slider_position) {
+                    Ok(()) => {
+                        self.position = slider_position;
+                    }
+
+                    Err(error) => {
+                        self.status = format!("Seek error: {error}");
+                    }
+                }
             }
 
             ui.label(format!(
@@ -482,9 +354,9 @@ impl eframe::App for SimpleMkvPlayer {
 
         ui.separator();
 
-        // ====================================================
+        // ----------------------------------------------------
         // AUDIO TRACKS
-        // ====================================================
+        // ----------------------------------------------------
 
         ui.heading("Audio Tracks");
 
@@ -496,20 +368,10 @@ impl eframe::App for SimpleMkvPlayer {
             ui.label("No audio streams detected.");
         }
 
-        // Borrow mixer separately so we can mutate track UI
-        // state without borrowing all of self at once.
-        let mixer = self.audio_mixer.as_ref();
-
         for track in &mut self.tracks {
             ui.group(|ui| {
                 ui.horizontal(|ui| {
-                    let enabled = ui.checkbox(&mut track.enabled, "");
-
-                    if enabled.changed() {
-                        if let Some(mixer) = mixer {
-                            mixer.set_track_enabled(track.audio_index, track.enabled);
-                        }
-                    }
+                    ui.checkbox(&mut track.enabled, "");
 
                     ui.strong(format!("Track {}", track.number));
 
@@ -517,16 +379,10 @@ impl eframe::App for SimpleMkvPlayer {
 
                     ui.add_space(10.0);
 
-                    let volume = ui.add_enabled(
+                    ui.add_enabled(
                         track.enabled,
                         egui::Slider::new(&mut track.volume, 0.0..=1.5).show_value(false),
                     );
-
-                    if volume.changed() {
-                        if let Some(mixer) = mixer {
-                            mixer.set_track_volume(track.audio_index, track.volume);
-                        }
-                    }
 
                     ui.label(format!("{:.0}%", track.volume * 100.0));
 
@@ -553,20 +409,18 @@ impl eframe::App for SimpleMkvPlayer {
                     }
 
                     if let Some(channels) = track.channels {
-                        let text = match channels {
+                        let channel_text = match channels {
                             1 => "Mono".to_string(),
-
                             2 => "Stereo".to_string(),
-
                             _ => format!("{} channels", channels),
                         };
 
-                        ui.label(text);
+                        ui.label(channel_text);
                         ui.separator();
                     }
 
                     if let Some(layout) = &track.channel_layout {
-                        ui.label(format!("Layout: {layout}"));
+                        ui.label(format!("Layout: {}", layout));
 
                         ui.separator();
                     }
@@ -576,7 +430,7 @@ impl eframe::App for SimpleMkvPlayer {
                     if let Some(language) = &track.language {
                         ui.separator();
 
-                        ui.label(format!("Language: {language}"));
+                        ui.label(format!("Language: {}", language));
                     }
                 });
             });
