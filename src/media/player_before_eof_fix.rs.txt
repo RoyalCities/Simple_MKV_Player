@@ -171,21 +171,6 @@ impl MpvPlayer {
         };
 
         self.check(result, "disable mpv audio")?;
-        // Keep the video output alive at EOF so seeking
-        // backwards still has a valid render target.
-        let keep_open_name = CString::new("keep-open").unwrap();
-
-        let keep_open_value = CString::new("yes").unwrap();
-
-        let result = unsafe {
-            (self.api.set_option_string)(
-                self.handle,
-                keep_open_name.as_ptr(),
-                keep_open_value.as_ptr(),
-            )
-        };
-
-        self.check(result, "set keep-open")?;
 
         let result = unsafe { (self.api.initialize)(self.handle) };
 

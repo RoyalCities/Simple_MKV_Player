@@ -30,13 +30,9 @@ struct OutputTrack {
 
     enabled: Arc<AtomicBool>,
 
-    pre_peak_bits: Arc<AtomicU32>,
+    peak_bits: Arc<AtomicU32>,
 
-    pre_rms_bits: Arc<AtomicU32>,
-
-    post_peak_bits: Arc<AtomicU32>,
-
-    post_rms_bits: Arc<AtomicU32>,
+    rms_bits: Arc<AtomicU32>,
 }
 
 struct DecoderRuntime {
@@ -52,13 +48,9 @@ struct DecoderRuntime {
 
     enabled: Arc<AtomicBool>,
 
-    pre_peak_bits: Arc<AtomicU32>,
+    peak_bits: Arc<AtomicU32>,
 
-    pre_rms_bits: Arc<AtomicU32>,
-
-    post_peak_bits: Arc<AtomicU32>,
-
-    post_rms_bits: Arc<AtomicU32>,
+    rms_bits: Arc<AtomicU32>,
 }
 
 pub struct AudioMixer {
@@ -195,6 +187,7 @@ impl AudioMixer {
 
         self.rebuild_output_tracks()?;
 
+        // Prime about 100 ms per decoder before playback.
         let minimum_samples = (self.sample_rate as usize * self.channels as usize) / 10;
 
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -241,13 +234,9 @@ impl AudioMixer {
 
         let volume_bits = Arc::new(AtomicU32::new(config.volume.clamp(0.0, 2.0).to_bits()));
 
-        let pre_peak_bits = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
+        let peak_bits = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
 
-        let pre_rms_bits = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
-
-        let post_peak_bits = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
-
-        let post_rms_bits = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
+        let rms_bits = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
 
         let map = format!("0:a:{}", config.audio_index);
 
@@ -363,11 +352,8 @@ impl AudioMixer {
                 queue,
                 volume_bits,
                 enabled,
-
-                pre_peak_bits,
-                pre_rms_bits,
-                post_peak_bits,
-                post_rms_bits,
+                peak_bits,
+                rms_bits,
             },
         );
 
@@ -390,13 +376,9 @@ impl AudioMixer {
 
                 enabled: Arc::clone(&decoder.enabled),
 
-                pre_peak_bits: Arc::clone(&decoder.pre_peak_bits),
+                peak_bits: Arc::clone(&decoder.peak_bits),
 
-                pre_rms_bits: Arc::clone(&decoder.pre_rms_bits),
-
-                post_peak_bits: Arc::clone(&decoder.post_peak_bits),
-
-                post_rms_bits: Arc::clone(&decoder.post_rms_bits),
+                rms_bits: Arc::clone(&decoder.rms_bits),
             });
         }
 
@@ -417,23 +399,14 @@ impl AudioMixer {
         }
     }
 
-    pub fn track_levels_db(&self, audio_index: usize) -> Option<(f32, f32, f32, f32)> {
+    pub fn track_levels_db(&self, audio_index: usize) -> Option<(f32, f32)> {
         let decoder = self.decoders.get(&audio_index)?;
 
-        let pre_peak = f32::from_bits(decoder.pre_peak_bits.load(Ordering::Relaxed));
+        let peak = f32::from_bits(decoder.peak_bits.load(Ordering::Relaxed));
 
-        let pre_rms = f32::from_bits(decoder.pre_rms_bits.load(Ordering::Relaxed));
+        let rms = f32::from_bits(decoder.rms_bits.load(Ordering::Relaxed));
 
-        let post_peak = f32::from_bits(decoder.post_peak_bits.load(Ordering::Relaxed));
-
-        let post_rms = f32::from_bits(decoder.post_rms_bits.load(Ordering::Relaxed));
-
-        Some((
-            linear_to_db(pre_peak),
-            linear_to_db(pre_rms),
-            linear_to_db(post_peak),
-            linear_to_db(post_rms),
-        ))
+        Some((linear_to_db(peak), linear_to_db(rms)))
     }
 
     pub fn stop_all(&mut self) {
@@ -475,14 +448,6 @@ fn linear_to_db(value: f32) -> f32 {
     }
 }
 
-fn smooth_meter(old: f32, new: f32, release: f32) -> f32 {
-    if new >= old {
-        new
-    } else {
-        old * release + new * (1.0 - release)
-    }
-}
-
 fn mix_samples(
     count: usize,
     tracks: &Arc<Mutex<Vec<OutputTrack>>>,
@@ -507,77 +472,72 @@ fn mix_samples(
             continue;
         };
 
-        let mut pre_peak = 0.0_f32;
+        let mut peak = 0.0_f32;
 
-        let mut pre_square_sum = 0.0_f64;
-
-        let mut post_peak = 0.0_f32;
-
-        let mut post_square_sum = 0.0_f64;
+        let mut square_sum = 0.0_f64;
 
         for sample in mixed.iter_mut() {
+            // Always consume raw PCM even when muted,
+            // otherwise re-enabling a track would play
+            // old buffered audio.
+
             let source = queue.pop_front().unwrap_or(0.0);
 
-            let pre_abs = source.abs();
+            // ------------------------------------------------
+            // PRE-FADER LEVEL METER
+            // ------------------------------------------------
 
-            pre_peak = pre_peak.max(pre_abs);
+            let absolute = source.abs();
 
-            pre_square_sum += (source as f64) * (source as f64);
+            peak = peak.max(absolute);
 
-            let post = if enabled { source * volume } else { 0.0 };
+            square_sum += (source as f64) * (source as f64);
 
-            let post_abs = post.abs();
+            // ------------------------------------------------
+            // MIX
+            // ------------------------------------------------
 
-            post_peak = post_peak.max(post_abs);
-
-            post_square_sum += (post as f64) * (post as f64);
-
-            *sample += post;
+            if enabled {
+                *sample += source * volume;
+            }
         }
 
-        let pre_rms = if count > 0 {
-            (pre_square_sum / count as f64).sqrt() as f32
+        let rms = if count > 0 {
+            (square_sum / count as f64).sqrt() as f32
         } else {
             0.0
         };
 
-        let post_rms = if count > 0 {
-            (post_square_sum / count as f64).sqrt() as f32
+        // ----------------------------------------------------
+        // METER SMOOTHING
+        //
+        // Peak:
+        //   instantaneous attack
+        //   slower release
+        //
+        // RMS:
+        //   continuous smoothing
+        // ----------------------------------------------------
+
+        let old_peak = f32::from_bits(track.peak_bits.load(Ordering::Relaxed));
+
+        let smoothed_peak = if peak >= old_peak {
+            peak
         } else {
-            0.0
+            old_peak * 0.97 + peak * 0.03
         };
 
-        let old_pre_peak = f32::from_bits(track.pre_peak_bits.load(Ordering::Relaxed));
+        track
+            .peak_bits
+            .store(smoothed_peak.to_bits(), Ordering::Relaxed);
 
-        let old_pre_rms = f32::from_bits(track.pre_rms_bits.load(Ordering::Relaxed));
+        let old_rms = f32::from_bits(track.rms_bits.load(Ordering::Relaxed));
 
-        let old_post_peak = f32::from_bits(track.post_peak_bits.load(Ordering::Relaxed));
-
-        let old_post_rms = f32::from_bits(track.post_rms_bits.load(Ordering::Relaxed));
-
-        let new_pre_peak = smooth_meter(old_pre_peak, pre_peak, 0.95);
-
-        let new_pre_rms = old_pre_rms * 0.82 + pre_rms * 0.18;
-
-        let new_post_peak = smooth_meter(old_post_peak, post_peak, 0.95);
-
-        let new_post_rms = old_post_rms * 0.82 + post_rms * 0.18;
+        let smoothed_rms = old_rms * 0.82 + rms * 0.18;
 
         track
-            .pre_peak_bits
-            .store(new_pre_peak.to_bits(), Ordering::Relaxed);
-
-        track
-            .pre_rms_bits
-            .store(new_pre_rms.to_bits(), Ordering::Relaxed);
-
-        track
-            .post_peak_bits
-            .store(new_post_peak.to_bits(), Ordering::Relaxed);
-
-        track
-            .post_rms_bits
-            .store(new_post_rms.to_bits(), Ordering::Relaxed);
+            .rms_bits
+            .store(smoothed_rms.to_bits(), Ordering::Relaxed);
     }
 
     for sample in mixed.iter_mut() {

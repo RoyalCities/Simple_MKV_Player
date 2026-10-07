@@ -290,13 +290,7 @@ impl SimpleMkvPlayer {
     }
 
     fn seek_to(&mut self, seconds: f64) {
-        let max_seek = if self.duration > 0.10 {
-            self.duration - 0.05
-        } else {
-            self.duration
-        };
-
-        let seconds = seconds.clamp(0.0, max_seek.max(0.0));
+        let seconds = seconds.max(0.0);
 
         let was_playing = self.playing;
 
@@ -364,87 +358,87 @@ fn format_time(seconds: f64) -> String {
     }
 }
 
-fn meter_fraction(db: f32) -> f32 {
-    let clamped = db.clamp(-60.0, 0.0);
-
-    (clamped + 60.0) / 60.0
-}
-
-fn meter_fill_color(db: f32, enabled: bool, is_post: bool) -> egui::Color32 {
-    if !enabled {
-        if is_post {
-            return egui::Color32::from_rgb(85, 85, 85);
-        }
-
-        return egui::Color32::from_rgb(95, 95, 105);
-    }
-
-    if is_post {
-        if db > -3.0 {
-            egui::Color32::from_rgb(220, 70, 65)
-        } else if db > -12.0 {
-            egui::Color32::from_rgb(220, 185, 55)
-        } else {
-            egui::Color32::from_rgb(52, 190, 90)
-        }
-    } else {
-        egui::Color32::from_rgb(170, 225, 255)
-    }
-}
-
-fn draw_single_meter(
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    db: f32,
-    enabled: bool,
-    is_post: bool,
-) {
-    painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(15, 15, 15));
-
-    let fraction = meter_fraction(db);
-
-    let fill_top = rect.bottom() - rect.height() * fraction;
-
-    let fill_rect =
-        egui::Rect::from_min_max(egui::pos2(rect.left(), fill_top), rect.right_bottom());
-
-    painter.rect_filled(fill_rect, 2.0, meter_fill_color(db, enabled, is_post));
-
-    painter.line_segment(
-        [
-            egui::pos2(rect.left(), fill_top),
-            egui::pos2(rect.right(), fill_top),
-        ],
-        egui::Stroke::new(
-            2.0,
-            if enabled {
-                egui::Color32::WHITE
-            } else {
-                egui::Color32::from_gray(150)
-            },
-        ),
-    );
-}
-
-fn draw_dual_db_meters(ui: &mut egui::Ui, pre_peak_db: f32, post_peak_db: f32, enabled: bool) {
-    let size = egui::vec2(34.0, 112.0);
+fn draw_db_meter(ui: &mut egui::Ui, peak_db: f32, rms_db: f32) {
+    let size = egui::vec2(34.0, 170.0);
 
     let (rect, _response) = ui.allocate_exact_size(size, egui::Sense::hover());
 
     let painter = ui.painter();
 
-    let gap = 4.0;
-    let bar_width = (rect.width() - gap) / 2.0;
+    painter.rect_filled(rect, 3.0, ui.visuals().extreme_bg_color);
 
-    let pre_rect =
-        egui::Rect::from_min_max(rect.min, egui::pos2(rect.left() + bar_width, rect.bottom()));
+    let meter_min = -60.0_f32;
 
-    let post_rect =
-        egui::Rect::from_min_max(egui::pos2(pre_rect.right() + gap, rect.top()), rect.max);
+    let meter_max = 0.0_f32;
 
-    draw_single_meter(painter, pre_rect, pre_peak_db, enabled, false);
+    let peak = peak_db.clamp(meter_min, meter_max);
 
-    draw_single_meter(painter, post_rect, post_peak_db, enabled, true);
+    let rms = rms_db.clamp(meter_min, meter_max);
+
+    let peak_fraction = (peak - meter_min) / (meter_max - meter_min);
+
+    let rms_fraction = (rms - meter_min) / (meter_max - meter_min);
+
+    let peak_y = rect.bottom() - rect.height() * peak_fraction;
+
+    let rms_y = rect.bottom() - rect.height() * rms_fraction;
+
+    // -60 to -12 dB
+    let green_top_fraction = (-12.0 - meter_min) / (meter_max - meter_min);
+
+    let green_top = rect.bottom() - rect.height() * green_top_fraction;
+
+    if peak_y < rect.bottom() {
+        let bottom_section = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + 3.0, peak_y.max(green_top)),
+            egui::pos2(rect.right() - 3.0, rect.bottom() - 3.0),
+        );
+
+        if bottom_section.height() > 0.0 {
+            painter.rect_filled(bottom_section, 1.0, egui::Color32::from_rgb(52, 190, 90));
+        }
+    }
+
+    // -12 to -3 dB
+    let yellow_top_fraction = (-3.0 - meter_min) / (meter_max - meter_min);
+
+    let yellow_top = rect.bottom() - rect.height() * yellow_top_fraction;
+
+    if peak > -12.0 {
+        let top = peak_y.max(yellow_top);
+
+        let bottom = green_top;
+
+        let section = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + 3.0, top),
+            egui::pos2(rect.right() - 3.0, bottom),
+        );
+
+        if section.height() > 0.0 {
+            painter.rect_filled(section, 1.0, egui::Color32::from_rgb(220, 185, 55));
+        }
+    }
+
+    // -3 to 0 dB
+    if peak > -3.0 {
+        let section = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + 3.0, peak_y),
+            egui::pos2(rect.right() - 3.0, yellow_top),
+        );
+
+        if section.height() > 0.0 {
+            painter.rect_filled(section, 1.0, egui::Color32::from_rgb(220, 70, 65));
+        }
+    }
+
+    // RMS marker
+    painter.line_segment(
+        [
+            egui::pos2(rect.left() + 2.0, rms_y),
+            egui::pos2(rect.right() - 2.0, rms_y),
+        ],
+        egui::Stroke::new(2.0, egui::Color32::WHITE),
+    );
 }
 
 impl eframe::App for SimpleMkvPlayer {
@@ -481,7 +475,7 @@ impl eframe::App for SimpleMkvPlayer {
 
         let available_width = ui.available_width();
 
-        let video_height = (available_width * 9.0 / 16.0).min(ui.available_height() * 0.40);
+        let video_height = (available_width * 9.0 / 16.0).min(ui.available_height() * 0.52);
 
         let (rect, _) = ui.allocate_exact_size(
             egui::vec2(available_width, video_height),
@@ -588,14 +582,14 @@ impl eframe::App for SimpleMkvPlayer {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     for track in &mut self.tracks {
-                        let (pre_peak_db, _pre_rms_db, post_peak_db, _post_rms_db) = mixer
+                        let (peak_db, rms_db) = mixer
                             .and_then(|mixer| mixer.track_levels_db(track.audio_index))
-                            .unwrap_or((-60.0, -60.0, -60.0, -60.0));
+                            .unwrap_or((-60.0, -60.0));
 
                         ui.group(|ui| {
-                            ui.set_min_width(130.0);
+                            ui.set_min_width(155.0);
 
-                            ui.set_max_width(130.0);
+                            ui.set_max_width(155.0);
 
                             ui.vertical_centered(|ui| {
                                 ui.strong(format!("Track {}", track.number));
@@ -615,12 +609,7 @@ impl eframe::App for SimpleMkvPlayer {
                                 ui.add_space(8.0);
 
                                 ui.horizontal(|ui| {
-                                    draw_dual_db_meters(
-                                        ui,
-                                        pre_peak_db,
-                                        post_peak_db,
-                                        track.enabled,
-                                    );
+                                    draw_db_meter(ui, peak_db, rms_db);
 
                                     ui.add_space(8.0);
 
@@ -640,9 +629,10 @@ impl eframe::App for SimpleMkvPlayer {
                                 ui.add_space(4.0);
 
                                 ui.label(format!("{:.0}%", track.volume * 100.0));
-                                ui.small(format!("In  {:>5.1} dB", pre_peak_db));
 
-                                ui.small(format!("Out {:>5.1} dB", post_peak_db));
+                                ui.label(format!("Peak {:>5.1} dB", peak_db));
+
+                                ui.label(format!("RMS  {:>5.1} dB", rms_db));
 
                                 ui.add_space(5.0);
 

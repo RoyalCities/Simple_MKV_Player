@@ -5,12 +5,10 @@ use std::{ffi::c_void, ptr};
 use windows_sys::Win32::{
     Foundation::HWND,
     UI::WindowsAndMessaging::{
-        CreateWindowExW, DestroyWindow, MoveWindow, SW_HIDE, SW_SHOW, ShowWindow, WS_CHILD,
-        WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
+        CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DestroyWindow, GetClientRect, MoveWindow,
+        SW_HIDE, SW_SHOW, ShowWindow, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
     },
 };
-
-const SS_BLACKRECT: u32 = 0x00000004;
 
 pub struct VideoSurface {
     hwnd: HWND,
@@ -29,11 +27,11 @@ impl VideoSurface {
                 0,
                 class_name.as_ptr(),
                 ptr::null(),
-                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN | SS_BLACKRECT,
-                0, // x
-                0, // y
-                1, // width
-                1, // height
+                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
+                0,
+                0,
+                1,
+                1,
                 parent,
                 ptr::null_mut(),
                 ptr::null_mut(),
@@ -95,17 +93,22 @@ impl Drop for VideoSurface {
     }
 }
 
+// ------------------------------------------------------------
+// Extract Win32 HWND from anything implementing
+// raw-window-handle 0.6's HasWindowHandle.
+// ------------------------------------------------------------
+
 pub fn hwnd_from_handle<T>(value: &T) -> Result<HWND, String>
 where
     T: HasWindowHandle,
 {
     let handle = value
         .window_handle()
-        .map_err(|error| format!("Could not obtain window handle: {error}"))?;
+        .map_err(|e| format!("Could not obtain window handle: {e}"))?;
 
     match handle.as_raw() {
         RawWindowHandle::Win32(win32) => Ok(win32.hwnd.get() as *mut c_void),
 
-        _ => Err("Native video embedding currently requires Windows.".into()),
+        _ => Err("Simple MKV Player native video embedding currently requires Windows.".into()),
     }
 }
