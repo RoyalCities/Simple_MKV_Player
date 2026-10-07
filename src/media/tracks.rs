@@ -1,9 +1,5 @@
 use serde::Deserialize;
-use std::{
-    collections::HashMap,
-    path::Path,
-    process::Command,
-};
+use std::{collections::HashMap, path::Path, process::Command};
 
 #[derive(Debug, Clone)]
 pub struct DetectedAudioTrack {
@@ -64,10 +60,7 @@ pub fn probe_audio_tracks(path: &Path) -> Result<Vec<DetectedAudioTrack>, String
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
 
-        return Err(format!(
-            "ffprobe failed:\n{}",
-            stderr.trim()
-        ));
+        return Err(format!("ffprobe failed:\n{}", stderr.trim()));
     }
 
     let probe: ProbeOutput = serde_json::from_slice(&output.stdout)
@@ -84,10 +77,7 @@ pub fn probe_audio_tracks(path: &Path) -> Result<Vec<DetectedAudioTrack>, String
                 .cloned()
                 .unwrap_or_else(|| format!("Audio Track {}", audio_index + 1));
 
-            let language = stream
-                .tags
-                .get("language")
-                .cloned();
+            let language = stream.tags.get("language").cloned();
 
             let sample_rate = stream
                 .sample_rate
@@ -98,9 +88,7 @@ pub fn probe_audio_tracks(path: &Path) -> Result<Vec<DetectedAudioTrack>, String
                 audio_index,
                 stream_index: stream.index,
                 title,
-                codec: stream
-                    .codec_name
-                    .unwrap_or_else(|| "unknown".to_string()),
+                codec: stream.codec_name.unwrap_or_else(|| "unknown".to_string()),
                 sample_rate,
                 channels: stream.channels,
                 channel_layout: stream.channel_layout,

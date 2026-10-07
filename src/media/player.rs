@@ -1,195 +1,363 @@
-use serde_json::{json, Value};
+use libloading::Library;
 use std::{
-    fs::OpenOptions,
-    io::{BufRead, BufReader, Write},
-    path::Path,
-    process::{Child, Command, Stdio},
-    thread,
-    time::Duration,
+    ffi::{CStr, CString, c_char, c_int, c_void},
+    path::{Path, PathBuf},
+    ptr,
 };
 
-const MPV_EXE: &str = r"C:\Program Files\MPV Player\mpv.exe";
-const PIPE_NAME: &str = r"\\.\pipe\simple_mkv_player_mpv";
+type MpvHandle = c_void;
+
+type MpvCreate = unsafe extern "C" fn() -> *mut MpvHandle;
+
+type MpvInitialize = unsafe extern "C" fn(*mut MpvHandle) -> c_int;
+
+type MpvTerminateDestroy = unsafe extern "C" fn(*mut MpvHandle);
+
+type MpvCommand = unsafe extern "C" fn(*mut MpvHandle, *const *const c_char) -> c_int;
+
+type MpvGetProperty =
+    unsafe extern "C" fn(*mut MpvHandle, *const c_char, c_int, *mut c_void) -> c_int;
+
+type MpvSetProperty =
+    unsafe extern "C" fn(*mut MpvHandle, *const c_char, c_int, *mut c_void) -> c_int;
+
+type MpvErrorString = unsafe extern "C" fn(c_int) -> *const c_char;
+
+// ------------------------------------------------------------
+// Values from mpv/client.h
+// ------------------------------------------------------------
+
+const MPV_FORMAT_FLAG: c_int = 3;
+const MPV_FORMAT_DOUBLE: c_int = 5;
+
+// ------------------------------------------------------------
+// Resolved libmpv API
+// ------------------------------------------------------------
+
+struct MpvApi {
+    create: MpvCreate,
+    initialize: MpvInitialize,
+    terminate_destroy: MpvTerminateDestroy,
+    command: MpvCommand,
+    get_property: MpvGetProperty,
+    set_property: MpvSetProperty,
+    error_string: MpvErrorString,
+}
+
+// ------------------------------------------------------------
+// Persistent player
+//
+// Field order matters:
+//
+// handle is destroyed manually before _library is dropped.
+// _library then keeps libmpv loaded for the entire lifetime
+// of the player.
+// ------------------------------------------------------------
 
 pub struct MpvPlayer {
-    child: Option<Child>,
+    handle: *mut MpvHandle,
+    api: MpvApi,
+
+    // Keep the DLL loaded while any function pointers or
+    // mpv handles are alive.
+    _library: Library,
+
+    loaded: bool,
 }
 
 impl MpvPlayer {
     pub fn new() -> Self {
-        Self { child: None }
+        match Self::try_new() {
+            Ok(player) => player,
+
+            Err(error) => {
+                panic!("Could not initialize libmpv: {error}");
+            }
+        }
     }
+
+    fn try_new() -> Result<Self, String> {
+        let dll_path = Self::dll_path()?;
+
+        let library = unsafe {
+            Library::new(&dll_path)
+                .map_err(|e| format!("Could not load {}: {e}", dll_path.display()))?
+        };
+
+        unsafe {
+            let create: MpvCreate = *library
+                .get::<MpvCreate>(b"mpv_create\0")
+                .map_err(|e| format!("Missing mpv_create: {e}"))?;
+
+            let initialize: MpvInitialize = *library
+                .get::<MpvInitialize>(b"mpv_initialize\0")
+                .map_err(|e| format!("Missing mpv_initialize: {e}"))?;
+
+            let terminate_destroy: MpvTerminateDestroy = *library
+                .get::<MpvTerminateDestroy>(b"mpv_terminate_destroy\0")
+                .map_err(|e| format!("Missing mpv_terminate_destroy: {e}"))?;
+
+            let command: MpvCommand = *library
+                .get::<MpvCommand>(b"mpv_command\0")
+                .map_err(|e| format!("Missing mpv_command: {e}"))?;
+
+            let get_property: MpvGetProperty = *library
+                .get::<MpvGetProperty>(b"mpv_get_property\0")
+                .map_err(|e| format!("Missing mpv_get_property: {e}"))?;
+
+            let set_property: MpvSetProperty = *library
+                .get::<MpvSetProperty>(b"mpv_set_property\0")
+                .map_err(|e| format!("Missing mpv_set_property: {e}"))?;
+
+            let error_string: MpvErrorString = *library
+                .get::<MpvErrorString>(b"mpv_error_string\0")
+                .map_err(|e| format!("Missing mpv_error_string: {e}"))?;
+
+            let api = MpvApi {
+                create,
+                initialize,
+                terminate_destroy,
+                command,
+                get_property,
+                set_property,
+                error_string,
+            };
+
+            let handle = (api.create)();
+
+            if handle.is_null() {
+                return Err("mpv_create() returned NULL.".into());
+            }
+
+            // Initialize libmpv once.
+            //
+            // Unlike our old backend, this mpv instance remains
+            // alive for the lifetime of the GUI.
+            let result = (api.initialize)(handle);
+
+            if result < 0 {
+                let message = Self::error_from_api(&api, result);
+
+                (api.terminate_destroy)(handle);
+
+                return Err(format!("mpv_initialize() failed: {message}"));
+            }
+
+            Ok(Self {
+                handle,
+                api,
+                _library: library,
+                loaded: false,
+            })
+        }
+    }
+
+    // --------------------------------------------------------
+    // Load media into the EXISTING mpv context.
+    //
+    // No process is created.
+    // No named pipe is created.
+    // No new mpv context is created.
+    // --------------------------------------------------------
 
     pub fn load(&mut self, path: &Path) -> Result<(), String> {
-        self.stop();
+        let path_string = path.to_string_lossy().into_owned();
 
-        if !Path::new(MPV_EXE).exists() {
-            return Err(format!("mpv.exe not found at {MPV_EXE}"));
-        }
+        self.command(&["loadfile", &path_string, "replace"])?;
 
-        let child = Command::new(MPV_EXE)
-            .arg("--no-config")
-            .arg("--force-window=yes")
-            .arg("--keep-open=yes")
-            .arg("--pause=yes")
-            .arg("--idle=no")
-            .arg("--osc=yes")
-            .arg("--input-default-bindings=yes")
-            .arg(format!("--input-ipc-server={PIPE_NAME}"))
-            .arg(path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("Could not start mpv: {e}"))?;
+        self.loaded = true;
 
-        self.child = Some(child);
+        // Match our previous behavior: newly opened files start
+        // paused.
+        self.set_paused(true)?;
 
-        // mpv needs a moment to create the Windows named pipe.
-        for _ in 0..50 {
-            if self.can_connect() {
-                return Ok(());
-            }
-
-            thread::sleep(Duration::from_millis(50));
-        }
-
-        Err("mpv started, but its IPC pipe did not become available.".into())
+        Ok(())
     }
 
-    fn can_connect(&self) -> bool {
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(PIPE_NAME)
-            .is_ok()
-    }
-
-    fn request(&self, command: Value) -> Result<Value, String> {
-        let mut pipe = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(PIPE_NAME)
-            .map_err(|e| format!("Could not connect to mpv IPC: {e}"))?;
-
-        let request = json!({
-            "command": command,
-            "request_id": 1
-        });
-
-        let mut encoded = serde_json::to_vec(&request)
-            .map_err(|e| format!("Could not encode mpv command: {e}"))?;
-
-        encoded.push(b'\n');
-
-        pipe.write_all(&encoded)
-            .map_err(|e| format!("Could not send command to mpv: {e}"))?;
-
-        pipe.flush()
-            .map_err(|e| format!("Could not flush mpv command: {e}"))?;
-
-        let mut reader = BufReader::new(pipe);
-        let mut line = String::new();
-
-        loop {
-            line.clear();
-
-            let bytes = reader
-                .read_line(&mut line)
-                .map_err(|e| format!("Could not read mpv response: {e}"))?;
-
-            if bytes == 0 {
-                return Err("mpv IPC closed before returning a response.".into());
-            }
-
-            let response: Value = serde_json::from_str(line.trim())
-                .map_err(|e| format!("Invalid JSON from mpv: {e}"))?;
-
-            // Ignore asynchronous events.
-            if response.get("request_id").and_then(Value::as_i64) == Some(1) {
-                if response
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .unwrap_or("success")
-                    != "success"
-                {
-                    return Err(format!(
-                        "mpv error: {}",
-                        response["error"]
-                    ));
-                }
-
-                return Ok(response);
-            }
-        }
-    }
+    // --------------------------------------------------------
+    // Playback controls
+    // --------------------------------------------------------
 
     pub fn set_paused(&self, paused: bool) -> Result<(), String> {
-        self.request(json!(["set_property", "pause", paused]))?;
-        Ok(())
+        let name = CString::new("pause").unwrap();
+
+        let mut value: c_int = if paused { 1 } else { 0 };
+
+        let result = unsafe {
+            (self.api.set_property)(
+                self.handle,
+                name.as_ptr(),
+                MPV_FORMAT_FLAG,
+                (&mut value as *mut c_int).cast(),
+            )
+        };
+
+        self.check(result, "set pause")
     }
 
     pub fn paused(&self) -> Result<bool, String> {
-        let response =
-            self.request(json!(["get_property", "pause"]))?;
+        let name = CString::new("pause").unwrap();
 
-        response["data"]
-            .as_bool()
-            .ok_or_else(|| "mpv returned an invalid pause value.".into())
+        let mut value: c_int = 0;
+
+        let result = unsafe {
+            (self.api.get_property)(
+                self.handle,
+                name.as_ptr(),
+                MPV_FORMAT_FLAG,
+                (&mut value as *mut c_int).cast(),
+            )
+        };
+
+        self.check(result, "get pause")?;
+
+        Ok(value != 0)
     }
 
     pub fn position(&self) -> Result<f64, String> {
-        let response =
-            self.request(json!(["get_property", "time-pos"]))?;
-
-        Ok(response["data"].as_f64().unwrap_or(0.0))
+        self.get_double_property("time-pos")
     }
 
     pub fn duration(&self) -> Result<f64, String> {
-        let response =
-            self.request(json!(["get_property", "duration"]))?;
-
-        Ok(response["data"].as_f64().unwrap_or(0.0))
+        self.get_double_property("duration")
     }
 
     pub fn seek_absolute(&self, seconds: f64) -> Result<(), String> {
-        self.request(json!([
-            "seek",
-            seconds,
-            "absolute+exact"
-        ]))?;
+        let seconds_string = format!("{seconds:.6}");
 
-        Ok(())
+        self.command(&["seek", &seconds_string, "absolute+exact"])
     }
 
+    // --------------------------------------------------------
+    // Stop current media WITHOUT destroying libmpv.
+    //
+    // This is the important difference from our IPC backend.
+    // The libmpv context stays alive and can load another MKV.
+    // --------------------------------------------------------
+
     pub fn stop(&mut self) {
-        if self.child.is_some() {
-            let _ = self.request(json!(["quit"]));
+        if self.loaded && !self.handle.is_null() {
+            let _ = self.command(&["stop"]);
         }
 
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        self.loaded = false;
     }
 
     pub fn is_running(&mut self) -> bool {
-        match self.child.as_mut() {
-            Some(child) => match child.try_wait() {
-                Ok(Some(_)) => {
-                    self.child = None;
-                    false
-                }
-                Ok(None) => true,
-                Err(_) => false,
-            },
-            None => false,
+        self.loaded && !self.handle.is_null()
+    }
+
+    // --------------------------------------------------------
+    // Generic command helper
+    // --------------------------------------------------------
+
+    fn command(&self, args: &[&str]) -> Result<(), String> {
+        if self.handle.is_null() {
+            return Err("libmpv handle is NULL.".into());
         }
+
+        let strings: Vec<CString> = args
+            .iter()
+            .map(|value| {
+                CString::new(*value)
+                    .map_err(|_| format!("mpv argument contains an embedded NUL: {value:?}"))
+            })
+            .collect::<Result<_, _>>()?;
+
+        let mut pointers: Vec<*const c_char> = strings.iter().map(|value| value.as_ptr()).collect();
+
+        // mpv_command requires a NULL-terminated argv array.
+        pointers.push(ptr::null());
+
+        let result = unsafe { (self.api.command)(self.handle, pointers.as_ptr()) };
+
+        self.check(result, args.first().copied().unwrap_or("command"))
+    }
+
+    // --------------------------------------------------------
+    // Property helper
+    // --------------------------------------------------------
+
+    fn get_double_property(&self, property: &str) -> Result<f64, String> {
+        let name =
+            CString::new(property).map_err(|_| format!("Invalid mpv property name: {property}"))?;
+
+        let mut value = 0.0_f64;
+
+        let result = unsafe {
+            (self.api.get_property)(
+                self.handle,
+                name.as_ptr(),
+                MPV_FORMAT_DOUBLE,
+                (&mut value as *mut f64).cast(),
+            )
+        };
+
+        self.check(result, &format!("get {property}"))?;
+
+        Ok(value)
+    }
+
+    // --------------------------------------------------------
+    // Error handling
+    // --------------------------------------------------------
+
+    fn check(&self, result: c_int, operation: &str) -> Result<(), String> {
+        if result >= 0 {
+            return Ok(());
+        }
+
+        Err(format!(
+            "{operation}: {}",
+            Self::error_from_api(&self.api, result,)
+        ))
+    }
+
+    fn error_from_api(api: &MpvApi, code: c_int) -> String {
+        unsafe {
+            let ptr = (api.error_string)(code);
+
+            if ptr.is_null() {
+                return format!("mpv error {code}");
+            }
+
+            CStr::from_ptr(ptr).to_string_lossy().into_owned()
+        }
+    }
+
+    // --------------------------------------------------------
+    // Vendored DLL location
+    // --------------------------------------------------------
+
+    fn dll_path() -> Result<PathBuf, String> {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("vendor")
+            .join("mpv")
+            .join("libmpv-2.dll");
+
+        if !path.exists() {
+            return Err(format!("Vendored libmpv DLL not found: {}", path.display()));
+        }
+
+        Ok(path)
     }
 }
 
+// ------------------------------------------------------------
+// Destroy the persistent mpv context exactly once.
+//
+// Because _library is a field on MpvPlayer, the DLL remains
+// loaded until AFTER this Drop implementation completes.
+// ------------------------------------------------------------
+
 impl Drop for MpvPlayer {
     fn drop(&mut self) {
-        self.stop();
+        if !self.handle.is_null() {
+            unsafe {
+                (self.api.terminate_destroy)(self.handle);
+            }
+
+            self.handle = ptr::null_mut();
+        }
     }
 }

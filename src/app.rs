@@ -1,7 +1,4 @@
-use crate::media::{
-    player::MpvPlayer,
-    tracks::probe_audio_tracks,
-};
+use crate::media::{player::MpvPlayer, tracks::probe_audio_tracks};
 
 use eframe::egui;
 use std::{
@@ -96,9 +93,7 @@ impl SimpleMkvPlayer {
             }
 
             Err(error) => {
-                self.status = format!(
-                    "Audio probe failed: {error}"
-                );
+                self.status = format!("Audio probe failed: {error}");
             }
         }
 
@@ -117,19 +112,15 @@ impl SimpleMkvPlayer {
                 // Give mpv a brief chance to finish loading metadata.
                 std::thread::sleep(Duration::from_millis(100));
 
-                self.duration =
-                    self.player.duration().unwrap_or(0.0);
+                self.duration = self.player.duration().unwrap_or(0.0);
 
-                self.position =
-                    self.player.position().unwrap_or(0.0);
+                self.position = self.player.position().unwrap_or(0.0);
 
                 self.playing = !self.player.paused().unwrap_or(true);
             }
 
             Err(error) => {
-                self.status = format!(
-                    "Playback error: {error}"
-                );
+                self.status = format!("Playback error: {error}");
             }
         }
     }
@@ -172,9 +163,7 @@ impl SimpleMkvPlayer {
             }
 
             Err(error) => {
-                self.status = format!(
-                    "Playback control error: {error}"
-                );
+                self.status = format!("Playback control error: {error}");
             }
         }
     }
@@ -199,17 +188,12 @@ fn format_time(seconds: f64) -> String {
 }
 
 impl eframe::App for SimpleMkvPlayer {
-    fn ui(
-        &mut self,
-        ui: &mut egui::Ui,
-        _frame: &mut eframe::Frame,
-    ) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_player();
 
         // Keep refreshing while playback is active.
         if self.playing {
-            ui.ctx()
-                .request_repaint_after(Duration::from_millis(100));
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
 
         // ----------------------------------------------------
@@ -224,11 +208,7 @@ impl eframe::App for SimpleMkvPlayer {
             ui.separator();
 
             if let Some(path) = &self.current_file {
-                ui.label(
-                    path.file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy(),
-                );
+                ui.label(path.file_name().unwrap_or_default().to_string_lossy());
             } else {
                 ui.label("No file loaded");
             }
@@ -245,23 +225,14 @@ impl eframe::App for SimpleMkvPlayer {
 
         let available_width = ui.available_width();
 
-        let video_height =
-            (available_width * 9.0 / 16.0)
-                .min(ui.available_height() * 0.55);
+        let video_height = (available_width * 9.0 / 16.0).min(ui.available_height() * 0.55);
 
         let (rect, _) = ui.allocate_exact_size(
-            egui::vec2(
-                available_width,
-                video_height,
-            ),
+            egui::vec2(available_width, video_height),
             egui::Sense::hover(),
         );
 
-        ui.painter().rect_filled(
-            rect,
-            4.0,
-            egui::Color32::BLACK,
-        );
+        ui.painter().rect_filled(rect, 4.0, egui::Color32::BLACK);
 
         ui.painter().text(
             rect.center(),
@@ -282,48 +253,35 @@ impl eframe::App for SimpleMkvPlayer {
         // ----------------------------------------------------
 
         ui.horizontal(|ui| {
-            let button_text =
-                if self.playing { "Pause" } else { "Play" };
+            let button_text = if self.playing { "Pause" } else { "Play" };
 
             if ui.button(button_text).clicked() {
                 self.toggle_playback();
             }
 
-            let max_duration =
-                if self.duration > 0.0 {
-                    self.duration
-                } else {
-                    1.0
-                };
+            let max_duration = if self.duration > 0.0 {
+                self.duration
+            } else {
+                1.0
+            };
 
-            let mut slider_position =
-                self.position.clamp(0.0, max_duration);
+            let mut slider_position = self.position.clamp(0.0, max_duration);
 
-            let slider_response = ui.add(
-                egui::Slider::new(
-                    &mut slider_position,
-                    0.0..=max_duration,
-                )
-                .show_value(false),
-            );
+            let slider_response = ui
+                .add(egui::Slider::new(&mut slider_position, 0.0..=max_duration).show_value(false));
 
             if slider_response.changed() {
                 self.position = slider_position;
             }
 
             if slider_response.drag_stopped() {
-                match self
-                    .player
-                    .seek_absolute(slider_position)
-                {
+                match self.player.seek_absolute(slider_position) {
                     Ok(()) => {
                         self.position = slider_position;
                     }
 
                     Err(error) => {
-                        self.status = format!(
-                            "Seek error: {error}"
-                        );
+                        self.status = format!("Seek error: {error}");
                     }
                 }
             }
@@ -347,24 +305,16 @@ impl eframe::App for SimpleMkvPlayer {
 
         ui.add_space(5.0);
 
-        if self.tracks.is_empty()
-            && self.current_file.is_some()
-        {
+        if self.tracks.is_empty() && self.current_file.is_some() {
             ui.label("No audio streams detected.");
         }
 
         for track in &mut self.tracks {
             ui.group(|ui| {
                 ui.horizontal(|ui| {
-                    ui.checkbox(
-                        &mut track.enabled,
-                        "",
-                    );
+                    ui.checkbox(&mut track.enabled, "");
 
-                    ui.strong(format!(
-                        "Track {}",
-                        track.number
-                    ));
+                    ui.strong(format!("Track {}", track.number));
 
                     ui.label(&track.name);
 
@@ -372,99 +322,56 @@ impl eframe::App for SimpleMkvPlayer {
 
                     ui.add_enabled(
                         track.enabled,
-                        egui::Slider::new(
-                            &mut track.volume,
-                            0.0..=1.5,
-                        )
-                        .show_value(false),
+                        egui::Slider::new(&mut track.volume, 0.0..=1.5).show_value(false),
                     );
 
-                    ui.label(format!(
-                        "{:.0}%",
-                        track.volume * 100.0
-                    ));
+                    ui.label(format!("{:.0}%", track.volume * 100.0));
 
-                    if ui
-                        .button("Export WAV")
-                        .clicked()
-                    {
-                        println!(
-                            "Export requested: audio stream {}",
-                            track.audio_index
-                        );
+                    if ui.button("Export WAV").clicked() {
+                        println!("Export requested: audio stream {}", track.audio_index);
                     }
                 });
 
                 ui.horizontal_wrapped(|ui| {
                     ui.add_space(25.0);
 
-                    ui.label(format!(
-                        "Codec: {}",
-                        track.codec.to_uppercase()
-                    ));
+                    ui.label(format!("Codec: {}", track.codec.to_uppercase()));
 
                     ui.separator();
 
-                    if let Some(rate) =
-                        track.sample_rate
-                    {
+                    if let Some(rate) = track.sample_rate {
                         if rate % 1000 == 0 {
-                            ui.label(format!(
-                                "{} kHz",
-                                rate / 1000
-                            ));
+                            ui.label(format!("{} kHz", rate / 1000));
                         } else {
-                            ui.label(format!(
-                                "{} Hz",
-                                rate
-                            ));
+                            ui.label(format!("{} Hz", rate));
                         }
 
                         ui.separator();
                     }
 
-                    if let Some(channels) =
-                        track.channels
-                    {
-                        let channel_text =
-                            match channels {
-                                1 => "Mono".to_string(),
-                                2 => "Stereo".to_string(),
-                                _ => format!(
-                                    "{} channels",
-                                    channels
-                                ),
-                            };
+                    if let Some(channels) = track.channels {
+                        let channel_text = match channels {
+                            1 => "Mono".to_string(),
+                            2 => "Stereo".to_string(),
+                            _ => format!("{} channels", channels),
+                        };
 
                         ui.label(channel_text);
                         ui.separator();
                     }
 
-                    if let Some(layout) =
-                        &track.channel_layout
-                    {
-                        ui.label(format!(
-                            "Layout: {}",
-                            layout
-                        ));
+                    if let Some(layout) = &track.channel_layout {
+                        ui.label(format!("Layout: {}", layout));
 
                         ui.separator();
                     }
 
-                    ui.label(format!(
-                        "MKV stream #{}",
-                        track.stream_index
-                    ));
+                    ui.label(format!("MKV stream #{}", track.stream_index));
 
-                    if let Some(language) =
-                        &track.language
-                    {
+                    if let Some(language) = &track.language {
                         ui.separator();
 
-                        ui.label(format!(
-                            "Language: {}",
-                            language
-                        ));
+                        ui.label(format!("Language: {}", language));
                     }
                 });
             });
@@ -475,10 +382,7 @@ impl eframe::App for SimpleMkvPlayer {
         if !self.tracks.is_empty() {
             ui.add_space(5.0);
 
-            if ui
-                .button("Export All Tracks")
-                .clicked()
-            {
+            if ui.button("Export All Tracks").clicked() {
                 println!("Export all requested");
             }
         }
