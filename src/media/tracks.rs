@@ -73,9 +73,11 @@ pub fn probe_audio_tracks(path: &Path) -> Result<Vec<DetectedAudioTrack>, String
         .map(|(audio_index, stream)| {
             let title = stream
                 .tags
-                .get("title")
-                .cloned()
-                .unwrap_or_else(|| format!("Audio Track {}", audio_index + 1));
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case("title"))
+                .map(|(_, value)| value.clone())
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_default();
 
             let language = stream.tags.get("language").cloned();
 

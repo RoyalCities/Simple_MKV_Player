@@ -23,7 +23,7 @@ pub struct AudioTrack {
     pub channel_layout: Option<String>,
     pub language: Option<String>,
     pub enabled: bool,
-    pub gain_db: f32,
+    pub volume: f32,
 }
 
 pub struct SimpleMkvPlayer {
@@ -34,8 +34,6 @@ pub struct SimpleMkvPlayer {
     video_surface: Option<VideoSurface>,
 
     audio_mixer: Option<AudioMixer>,
-
-    master_gain_db: f32,
 
     playing: bool,
     position: f64,
@@ -99,8 +97,6 @@ impl SimpleMkvPlayer {
             video_surface,
             audio_mixer,
 
-            master_gain_db: 0.0,
-
             playing: false,
             position: 0.0,
             duration: 0.0,
@@ -116,7 +112,7 @@ impl SimpleMkvPlayer {
             .map(|track| MixTrackConfig {
                 audio_index: track.audio_index,
 
-                gain_db: track.gain_db,
+                volume: track.volume,
 
                 enabled: track.enabled,
             })
@@ -188,7 +184,7 @@ impl SimpleMkvPlayer {
 
                         enabled: i == 0,
 
-                        gain_db: 0.0,
+                        volume: 1.0,
                     })
                     .collect();
             }
@@ -587,11 +583,6 @@ impl eframe::App for SimpleMkvPlayer {
 
         let mixer = self.audio_mixer.as_ref();
 
-        let (master_pre_peak_db, _master_pre_rms_db, master_post_peak_db, _master_post_rms_db) =
-            mixer
-                .map(|mixer| mixer.master_levels_db())
-                .unwrap_or((-60.0, -60.0, -60.0, -60.0));
-
         egui::ScrollArea::horizontal()
             .auto_shrink([false, true])
             .show(ui, |ui| {
@@ -602,31 +593,16 @@ impl eframe::App for SimpleMkvPlayer {
                             .unwrap_or((-60.0, -60.0, -60.0, -60.0));
 
                         ui.group(|ui| {
-                            ui.set_min_width(150.0);
-                            ui.set_max_width(150.0);
+                            ui.set_min_width(130.0);
+
+                            ui.set_max_width(130.0);
 
                             ui.vertical_centered(|ui| {
                                 ui.strong(format!("Track {}", track.number));
 
-                                let name_response = ui.add(
-                                    egui::TextEdit::singleline(&mut track.name)
-                                        .hint_text("(Track name)")
-                                        .desired_width(128.0),
-                                );
+                                ui.label(&track.name);
 
-                                let name_chars = track.name.chars().count();
-
-                                if name_response.has_focus() || name_chars > 64 {
-                                    let count_text = format!("{name_chars}/64");
-
-                                    if name_chars > 64 {
-                                        ui.colored_label(egui::Color32::YELLOW, count_text);
-                                    } else {
-                                        ui.small(count_text);
-                                    }
-                                } else {
-                                    ui.add_space(14.0);
-                                }
+                                ui.add_space(5.0);
 
                                 let enabled = ui.checkbox(&mut track.enabled, "Enabled");
 
@@ -636,52 +612,49 @@ impl eframe::App for SimpleMkvPlayer {
                                     }
                                 }
 
-                                ui.add_space(4.0);
-                                ui.small("Fader     Pre  Post");
+                                ui.add_space(8.0);
 
                                 ui.horizontal(|ui| {
-                                    let gain = ui.add_sized(
-                                        [28.0, 112.0],
-                                        egui::Slider::new(&mut track.gain_db, -60.0..=40.0)
-                                            .vertical()
-                                            .show_value(false),
-                                    );
-
-                                    if gain.changed() {
-                                        if let Some(mixer) = mixer {
-                                            mixer.set_track_gain_db(
-                                                track.audio_index,
-                                                track.gain_db,
-                                            );
-                                        }
-                                    }
-
-                                    ui.add_space(6.0);
-
                                     draw_dual_db_meters(
                                         ui,
                                         pre_peak_db,
                                         post_peak_db,
                                         track.enabled,
                                     );
+
+                                    ui.add_space(8.0);
+
+                                    let volume = ui.add(
+                                        egui::Slider::new(&mut track.volume, 0.0..=1.5)
+                                            .vertical()
+                                            .show_value(false),
+                                    );
+
+                                    if volume.changed() {
+                                        if let Some(mixer) = mixer {
+                                            mixer.set_track_volume(track.audio_index, track.volume);
+                                        }
+                                    }
                                 });
 
-                                ui.label(format!("{:+.1} dB", track.gain_db));
-                                ui.small(format!("Pre  {:>5.1} dB", pre_peak_db));
-                                ui.small(format!("Post {:>5.1} dB", post_peak_db));
+                                ui.add_space(4.0);
 
-                                ui.add_space(3.0);
+                                ui.label(format!("{:.0}%", track.volume * 100.0));
+                                ui.small(format!("In  {:>5.1} dB", pre_peak_db));
+
+                                ui.small(format!("Out {:>5.1} dB", post_peak_db));
+
+                                ui.add_space(5.0);
 
                                 if ui.button("Export WAV").clicked() {
                                     println!(
-                                        "Export requested: audio stream {} / title {:?}",
-                                        track.audio_index,
-                                        track.name.trim(),
+                                        "Export requested: audio stream {}",
+                                        track.audio_index
                                     );
                                 }
 
                                 ui.small(format!(
-                                    "{} / {} Hz / #{}",
+                                    "{} / {} Hz / stream #{}",
                                     track.codec.to_uppercase(),
                                     track.sample_rate.unwrap_or(0),
                                     track.stream_index
@@ -691,61 +664,6 @@ impl eframe::App for SimpleMkvPlayer {
 
                         ui.add_space(5.0);
                     }
-
-                    // MASTER uses the same visual language as a normal track.
-                    ui.group(|ui| {
-                        ui.set_min_width(150.0);
-                        ui.set_max_width(150.0);
-
-                        ui.vertical_centered(|ui| {
-                            ui.strong("MASTER");
-
-                            // Reserved name-row height so MASTER aligns with track strips.
-                            ui.add_space(24.0);
-                            ui.add_space(14.0);
-
-                            ui.label("Output Bus");
-
-                            ui.add_space(4.0);
-                            ui.small("Fader     Pre  Post");
-
-                            ui.horizontal(|ui| {
-                                let gain = ui.add_sized(
-                                    [28.0, 112.0],
-                                    egui::Slider::new(&mut self.master_gain_db, -60.0..=40.0)
-                                        .vertical()
-                                        .show_value(false),
-                                );
-
-                                if gain.changed() {
-                                    if let Some(mixer) = mixer {
-                                        mixer.set_master_gain_db(self.master_gain_db);
-                                    }
-                                }
-
-                                ui.add_space(6.0);
-
-                                draw_dual_db_meters(
-                                    ui,
-                                    master_pre_peak_db,
-                                    master_post_peak_db,
-                                    true,
-                                );
-                            });
-
-                            ui.label(format!("{:+.1} dB", self.master_gain_db));
-                            ui.small(format!("Pre  {:>5.1} dB", master_pre_peak_db));
-                            ui.small(format!("Post {:>5.1} dB", master_post_peak_db));
-
-                            ui.add_space(3.0);
-
-                            if ui.button("Export Mix").clicked() {
-                                println!("Export mix requested");
-                            }
-
-                            ui.small("Final output bus");
-                        });
-                    });
                 });
             });
 
