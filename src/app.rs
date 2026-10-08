@@ -85,7 +85,7 @@ pub struct SimpleMkvPlayer {
     duration: f64,
     video_fullscreen: bool,
     last_video_interaction: Instant,
-    video_height_override: Option<f32>,
+    video_split_ratio: Option<f32>,
 
     status: String,
     last_poll: Instant,
@@ -167,7 +167,7 @@ impl SimpleMkvPlayer {
             duration: 0.0,
             video_fullscreen: false,
             last_video_interaction: Instant::now(),
-            video_height_override: None,
+            video_split_ratio: None,
 
             status,
             last_poll: Instant::now(),
@@ -229,6 +229,161 @@ impl SimpleMkvPlayer {
 
         ui.painter()
             .rect_filled(lower_band, 0.0, egui::Color32::from_black_alpha(65));
+
+        // ----------------------------------------------------
+        // FULLSCREEN BUTTON
+        // ----------------------------------------------------
+
+        let fullscreen_button_size = 30.0;
+        let fullscreen_button_rect = egui::Rect::from_min_size(
+            egui::pos2(
+                rect.right() - fullscreen_button_size - 12.0,
+                rect.top() + 12.0,
+            ),
+            egui::vec2(fullscreen_button_size, fullscreen_button_size),
+        );
+
+        let fullscreen_response = ui.interact(
+            fullscreen_button_rect,
+            ui.make_persistent_id("video_fullscreen_button"),
+            egui::Sense::click(),
+        );
+
+        ui.painter().rect_filled(
+            fullscreen_button_rect,
+            6.0,
+            if fullscreen_response.hovered() {
+                egui::Color32::from_black_alpha(190)
+            } else {
+                egui::Color32::from_black_alpha(135)
+            },
+        );
+
+        let icon_rect = fullscreen_button_rect.shrink(8.0);
+        let icon_color = egui::Color32::WHITE;
+        let stroke = egui::Stroke::new(1.6, icon_color);
+        let corner = 5.0;
+
+        if fullscreen {
+            // Collapse icon: corners point inward.
+            let left = icon_rect.left();
+            let right = icon_rect.right();
+            let top = icon_rect.top();
+            let bottom = icon_rect.bottom();
+
+            ui.painter().line_segment(
+                [
+                    egui::pos2(left, top + corner),
+                    egui::pos2(left + corner, top + corner),
+                ],
+                stroke,
+            );
+            ui.painter().line_segment(
+                [
+                    egui::pos2(left + corner, top),
+                    egui::pos2(left + corner, top + corner),
+                ],
+                stroke,
+            );
+
+            ui.painter().line_segment(
+                [
+                    egui::pos2(right - corner, top),
+                    egui::pos2(right - corner, top + corner),
+                ],
+                stroke,
+            );
+            ui.painter().line_segment(
+                [
+                    egui::pos2(right - corner, top + corner),
+                    egui::pos2(right, top + corner),
+                ],
+                stroke,
+            );
+
+            ui.painter().line_segment(
+                [
+                    egui::pos2(left, bottom - corner),
+                    egui::pos2(left + corner, bottom - corner),
+                ],
+                stroke,
+            );
+            ui.painter().line_segment(
+                [
+                    egui::pos2(left + corner, bottom - corner),
+                    egui::pos2(left + corner, bottom),
+                ],
+                stroke,
+            );
+
+            ui.painter().line_segment(
+                [
+                    egui::pos2(right - corner, bottom - corner),
+                    egui::pos2(right, bottom - corner),
+                ],
+                stroke,
+            );
+            ui.painter().line_segment(
+                [
+                    egui::pos2(right - corner, bottom - corner),
+                    egui::pos2(right - corner, bottom),
+                ],
+                stroke,
+            );
+        } else {
+            // Expand icon: four outward-facing corners.
+            let left = icon_rect.left();
+            let right = icon_rect.right();
+            let top = icon_rect.top();
+            let bottom = icon_rect.bottom();
+
+            ui.painter().line_segment(
+                [egui::pos2(left, top), egui::pos2(left + corner, top)],
+                stroke,
+            );
+            ui.painter().line_segment(
+                [egui::pos2(left, top), egui::pos2(left, top + corner)],
+                stroke,
+            );
+
+            ui.painter().line_segment(
+                [egui::pos2(right - corner, top), egui::pos2(right, top)],
+                stroke,
+            );
+            ui.painter().line_segment(
+                [egui::pos2(right, top), egui::pos2(right, top + corner)],
+                stroke,
+            );
+
+            ui.painter().line_segment(
+                [egui::pos2(left, bottom - corner), egui::pos2(left, bottom)],
+                stroke,
+            );
+            ui.painter().line_segment(
+                [egui::pos2(left, bottom), egui::pos2(left + corner, bottom)],
+                stroke,
+            );
+
+            ui.painter().line_segment(
+                [
+                    egui::pos2(right, bottom - corner),
+                    egui::pos2(right, bottom),
+                ],
+                stroke,
+            );
+            ui.painter().line_segment(
+                [
+                    egui::pos2(right - corner, bottom),
+                    egui::pos2(right, bottom),
+                ],
+                stroke,
+            );
+        }
+
+        if fullscreen_response.clicked() {
+            self.last_video_interaction = Instant::now();
+            self.set_video_fullscreen(ui.ctx(), !fullscreen);
+        }
 
         // ----------------------------------------------------
         // SCRUB RAIL
@@ -384,7 +539,9 @@ impl SimpleMkvPlayer {
         // The whole bottom band owns pointer input while visible,
         // so video click/double-click gestures don't fire through it.
         pointer_pos
-            .map(|position| band_rect.contains(position))
+            .map(|position| {
+                band_rect.contains(position) || fullscreen_button_rect.contains(position)
+            })
             .unwrap_or(false)
     }
 
@@ -829,11 +986,7 @@ impl SimpleMkvPlayer {
 
         match self.player.load(&path) {
             Ok(()) => {
-                self.status = format!(
-                    "Loaded video with {} audio track{}.",
-                    self.tracks.len(),
-                    if self.tracks.len() == 1 { "" } else { "s" }
-                );
+                self.status.clear();
 
                 std::thread::sleep(Duration::from_millis(100));
 
@@ -1171,6 +1324,52 @@ fn draw_single_meter(
     );
 }
 
+fn draw_channel_meter_headers(ui: &mut egui::Ui) {
+    // Exact geometry of the row below:
+    // 28 px fader + 6 px gap + 34 px dual meter
+    // (15 px Pre + 4 px gap + 15 px Post).
+    let controls_width = 28.0 + 6.0 + 34.0;
+
+    // Allocate the full channel width, then draw the labels around
+    // the center of it. This keeps the labels directly above the
+    // controls even when channel cards dynamically grow wider.
+    let available_width = ui.available_width();
+
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(available_width, 14.0), egui::Sense::hover());
+
+    let controls_left = rect.center().x - controls_width / 2.0;
+
+    let painter = ui.painter();
+    let font = egui::FontId::proportional(9.0);
+    let color = ui.visuals().weak_text_color();
+
+    painter.text(
+        egui::pos2(controls_left + 9.5, rect.center().y),
+        egui::Align2::CENTER_CENTER,
+        "Vol.",
+        font.clone(),
+        color,
+    );
+
+    let meter_left = controls_left + 28.0 + 6.0;
+
+    painter.text(
+        egui::pos2(meter_left - 6.5, rect.center().y),
+        egui::Align2::CENTER_CENTER,
+        "Pre",
+        font.clone(),
+        color,
+    );
+
+    painter.text(
+        egui::pos2(meter_left + 12.5, rect.center().y),
+        egui::Align2::CENTER_CENTER,
+        "Post",
+        font,
+        color,
+    );
+}
+
 fn draw_dual_db_meters(ui: &mut egui::Ui, pre_peak_db: f32, post_peak_db: f32, enabled: bool) {
     let size = egui::vec2(34.0, 112.0);
 
@@ -1281,13 +1480,13 @@ impl eframe::App for SimpleMkvPlayer {
                 self.export_window_open = true;
             }
 
-            ui.separator();
-
-            if let Some(path) = &self.current_file {
-                ui.label(path.file_name().unwrap_or_default().to_string_lossy());
-            } else {
-                ui.label("No file loaded");
-            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if let Some(path) = &self.current_file {
+                    ui.label(path.file_name().unwrap_or_default().to_string_lossy());
+                } else {
+                    ui.label("No file loaded");
+                }
+            });
         });
 
         ui.separator();
@@ -1309,15 +1508,43 @@ impl eframe::App for SimpleMkvPlayer {
         // ====================================================
 
         let available_width = ui.available_width();
+        let available_height = ui.available_height();
 
-        let default_video_height = (available_width * 9.0 / 16.0).min(ui.available_height() * 0.40);
+        const MIN_VIDEO_HEIGHT: f32 = 180.0;
+        const NATURAL_MIXER_HEIGHT: f32 = 430.0;
+        const MIN_VISIBLE_MIXER_HEIGHT: f32 = 150.0;
+        const SPLITTER_ALLOWANCE: f32 = 14.0;
 
-        let max_video_height = (ui.available_height() * 0.75).max(180.0);
+        // The mixer gets its full natural height when the window can
+        // afford it. On shorter windows it gracefully gives up space
+        // and relies on its vertical scrollbar.
+        let target_mixer_height = NATURAL_MIXER_HEIGHT
+            .min(available_height * 0.45)
+            .max(MIN_VISIBLE_MIXER_HEIGHT);
 
+        // Do not allow the user to shrink the video beyond the point
+        // where the mixer already has all the useful height it needs.
+        // This prevents a large dead/empty region below the channel strips.
+        let min_video_height =
+            (available_height - NATURAL_MIXER_HEIGHT - SPLITTER_ALLOWANCE).max(MIN_VIDEO_HEIGHT);
+
+        // Likewise, always leave enough mixer visible to be useful.
+        let max_video_height = (available_height - MIN_VISIBLE_MIXER_HEIGHT - SPLITTER_ALLOWANCE)
+            .max(min_video_height);
+
+        // Default allocation consumes the whole usable window:
+        // extra vertical room belongs to the video, while the mixer
+        // settles around its natural height.
+        let default_video_height = (available_height - target_mixer_height - SPLITTER_ALLOWANCE)
+            .clamp(min_video_height, max_video_height);
+
+        // A manual splitter position is stored as a ratio so it remains
+        // sensible if the user later resizes the outer application window.
         let video_height = self
-            .video_height_override
+            .video_split_ratio
+            .map(|ratio| available_height * ratio)
             .unwrap_or(default_video_height)
-            .clamp(180.0, max_video_height);
+            .clamp(min_video_height, max_video_height);
 
         let (rect, video_response) = ui.allocate_exact_size(
             egui::vec2(available_width, video_height),
@@ -1382,15 +1609,16 @@ impl eframe::App for SimpleMkvPlayer {
         );
 
         if resize_response.double_clicked() {
-            self.video_height_override = None;
+            self.video_split_ratio = None;
             ui.ctx().request_repaint();
         } else if resize_response.dragged() {
             let delta_y = ui.input(|input| input.pointer.delta().y);
 
-            let current_height = self.video_height_override.unwrap_or(video_height);
+            let current_height = video_height;
 
-            self.video_height_override =
-                Some((current_height + delta_y).clamp(180.0, max_video_height));
+            let new_height = (current_height + delta_y).clamp(min_video_height, max_video_height);
+
+            self.video_split_ratio = Some((new_height / available_height.max(1.0)).clamp(0.0, 1.0));
 
             ui.ctx().request_repaint();
         }
@@ -1413,12 +1641,12 @@ impl eframe::App for SimpleMkvPlayer {
             .max_height(mixer_available_height)
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
+                ui.vertical_centered(|ui| {
                     ui.heading("Mixer");
 
-                    ui.separator();
-
-                    ui.label(&self.status);
+                    if !self.status.trim().is_empty() {
+                        ui.small(&self.status);
+                    }
                 });
 
                 ui.add_space(4.0);
@@ -1434,18 +1662,43 @@ impl eframe::App for SimpleMkvPlayer {
                     .map(|mixer| mixer.master_levels_db())
                     .unwrap_or((-60.0, -60.0, -60.0, -60.0));
 
+                const MIN_CHANNEL_WIDTH: f32 = 150.0;
+                const MAX_CHANNEL_WIDTH: f32 = 190.0;
+                const CHANNEL_GAP: f32 = 5.0;
+
+                let channel_count = self.tracks.len() + 1;
+                let mixer_view_width = ui.available_width();
+
+                let gap_total = CHANNEL_GAP * channel_count.saturating_sub(1) as f32;
+
+                let width_per_channel = if channel_count > 0 {
+                    (mixer_view_width - gap_total) / channel_count as f32
+                } else {
+                    MIN_CHANNEL_WIDTH
+                };
+
+                let mixer_channel_width =
+                    width_per_channel.clamp(MIN_CHANNEL_WIDTH, MAX_CHANNEL_WIDTH);
+
+                let mixer_content_width = mixer_channel_width * channel_count as f32 + gap_total;
+
+                let mixer_leading_space = ((mixer_view_width - mixer_content_width) / 2.0).max(0.0);
+
                 egui::ScrollArea::horizontal()
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
+                            if mixer_leading_space > 0.0 {
+                                ui.add_space(mixer_leading_space);
+                            }
                             for (track_index, track) in self.tracks.iter_mut().enumerate() {
                                 let (pre_peak_db, _pre_rms_db, post_peak_db, _post_rms_db) = mixer
                                     .and_then(|mixer| mixer.track_levels_db(track.audio_index))
                                     .unwrap_or((-60.0, -60.0, -60.0, -60.0));
 
                                 ui.group(|ui| {
-                                    ui.set_min_width(150.0);
-                                    ui.set_max_width(150.0);
+                                    ui.set_min_width(mixer_channel_width);
+                                    ui.set_max_width(mixer_channel_width);
 
                                     ui.vertical_centered(|ui| {
                                         ui.strong(format!("Track {}", track.number));
@@ -1453,7 +1706,9 @@ impl eframe::App for SimpleMkvPlayer {
                                         let name_response = ui.add(
                                             egui::TextEdit::singleline(&mut track.name)
                                                 .hint_text("(Track name)")
-                                                .desired_width(128.0),
+                                                .desired_width(
+                                                    (mixer_channel_width - 22.0).max(128.0),
+                                                ),
                                         );
 
                                         let name_chars = track.name.chars().count();
@@ -1482,9 +1737,18 @@ impl eframe::App for SimpleMkvPlayer {
                                         }
 
                                         ui.add_space(4.0);
-                                        ui.small("Fader     Pre  Post");
+                                        draw_channel_meter_headers(ui);
 
                                         ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 0.0;
+
+                                            let controls_width = 28.0 + 6.0 + 34.0;
+
+                                            let leading_space =
+                                                (ui.available_width() - controls_width) / 2.0;
+
+                                            ui.add_space(leading_space.max(0.0));
+
                                             let gain = ui.add_sized(
                                                 [28.0, 112.0],
                                                 egui::Slider::new(&mut track.gain_db, -60.0..=40.0)
@@ -1536,13 +1800,13 @@ impl eframe::App for SimpleMkvPlayer {
                                     });
                                 });
 
-                                ui.add_space(5.0);
+                                ui.add_space(CHANNEL_GAP);
                             }
 
                             // MASTER uses the same visual language as a normal track.
                             ui.group(|ui| {
-                                ui.set_min_width(150.0);
-                                ui.set_max_width(150.0);
+                                ui.set_min_width(mixer_channel_width);
+                                ui.set_max_width(mixer_channel_width);
 
                                 ui.vertical_centered(|ui| {
                                     ui.strong("MASTER");
@@ -1550,7 +1814,7 @@ impl eframe::App for SimpleMkvPlayer {
                                     ui.add(
                                         egui::TextEdit::singleline(&mut self.master_name)
                                             .hint_text("Master_Mix")
-                                            .desired_width(128.0),
+                                            .desired_width((mixer_channel_width - 22.0).max(128.0)),
                                     );
 
                                     ui.add_space(14.0);
@@ -1561,9 +1825,18 @@ impl eframe::App for SimpleMkvPlayer {
                                     );
 
                                     ui.add_space(4.0);
-                                    ui.small("Fader     Pre  Post");
+                                    draw_channel_meter_headers(ui);
 
                                     ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 0.0;
+
+                                        let controls_width = 28.0 + 6.0 + 34.0;
+
+                                        let leading_space =
+                                            (ui.available_width() - controls_width) / 2.0;
+
+                                        ui.add_space(leading_space.max(0.0));
+
                                         let gain = ui.add_sized(
                                             [28.0, 112.0],
                                             egui::Slider::new(
