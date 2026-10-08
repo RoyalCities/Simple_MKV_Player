@@ -1,5 +1,8 @@
 /target/
+/dist/
 *.pdb
 *.exe
+*_before_*.rs.txt
+*_backup.rs
 .DS_Store
 Thumbs.db

@@ -86,9 +86,6 @@ pub struct AudioTrack {
     pub name: String,
     pub codec: String,
     pub sample_rate: Option<u32>,
-    pub channels: Option<u32>,
-    pub channel_layout: Option<String>,
-    pub language: Option<String>,
     pub enabled: bool,
     pub gain_db: f32,
 }
@@ -1030,12 +1027,6 @@ impl SimpleMkvPlayer {
                         codec: track.codec,
 
                         sample_rate: track.sample_rate,
-
-                        channels: track.channels,
-
-                        channel_layout: track.channel_layout,
-
-                        language: track.language,
 
                         enabled: i == 0,
 

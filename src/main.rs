@@ -1,7 +1,6 @@
 mod app;
 mod export;
 mod media;
-mod ui;
 
 use app::SimpleMkvPlayer;
 use eframe::egui;

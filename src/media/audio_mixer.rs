@@ -221,25 +221,11 @@ impl AudioMixer {
         })
     }
 
-    pub fn sample_rate(&self) -> u32 {
-        self.sample_rate
-    }
-
-    pub fn channels(&self) -> u16 {
-        self.channels
-    }
-
     pub fn set_master_gain_db(&self, gain_db: f32) {
         self.master.volume_bits.store(
             db_to_linear(gain_db.clamp(-60.0, 40.0)).to_bits(),
             Ordering::Relaxed,
         );
-    }
-
-    pub fn master_gain_db(&self) -> f32 {
-        linear_to_gain_db(f32::from_bits(
-            self.master.volume_bits.load(Ordering::Relaxed),
-        ))
     }
 
     pub fn master_levels_db(&self) -> (f32, f32, f32, f32) {
@@ -554,14 +540,6 @@ impl Drop for AudioMixer {
 
 fn db_to_linear(db: f32) -> f32 {
     10.0_f32.powf(db / 20.0)
-}
-
-fn linear_to_gain_db(value: f32) -> f32 {
-    if value <= 0.000_001 {
-        -60.0
-    } else {
-        (20.0 * value.log10()).clamp(-60.0, 40.0)
-    }
 }
 
 fn linear_to_db(value: f32) -> f32 {

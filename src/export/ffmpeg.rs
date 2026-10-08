@@ -10,24 +10,6 @@ pub struct ExportMixTrack {
     pub gain_db: f32,
 }
 
-pub fn export_track_wav(
-    input_path: &Path,
-    output_path: &Path,
-    audio_index: usize,
-    gain_db: f32,
-    title: Option<&str>,
-) -> Result<(), String> {
-    export_track_wav_with_progress(
-        input_path,
-        output_path,
-        audio_index,
-        gain_db,
-        title,
-        0.0,
-        |_| {},
-    )
-}
-
 pub fn export_track_wav_with_progress<F>(
     input_path: &Path,
     output_path: &Path,
@@ -73,15 +55,6 @@ where
         .arg(output_path);
 
     run_ffmpeg_with_progress(&mut command, duration_seconds, progress)
-}
-
-pub fn export_mix_wav(
-    input_path: &Path,
-    output_path: &Path,
-    tracks: &[ExportMixTrack],
-    master_gain_db: f32,
-) -> Result<(), String> {
-    export_mix_wav_with_progress(input_path, output_path, tracks, master_gain_db, 0.0, |_| {})
 }
 
 pub fn export_video_mix_mkv_with_progress<F>(

@@ -457,14 +457,6 @@ impl MpvPlayer {
         self.command(&["seek", &seconds_string, "absolute+exact"])
     }
 
-    pub fn stop(&mut self) {
-        if self.loaded && self.initialized && !self.handle.is_null() {
-            let _ = self.command(&["stop"]);
-        }
-
-        self.loaded = false;
-    }
-
     pub fn is_running(&mut self) -> bool {
         self.loaded && self.initialized && !self.handle.is_null() && !self.render_context.is_null()
     }

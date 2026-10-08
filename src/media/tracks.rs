@@ -12,9 +12,6 @@ pub struct DetectedAudioTrack {
     pub title: String,
     pub codec: String,
     pub sample_rate: Option<u32>,
-    pub channels: Option<u32>,
-    pub channel_layout: Option<String>,
-    pub language: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -34,12 +31,6 @@ struct ProbeStream {
     sample_rate: Option<String>,
 
     #[serde(default)]
-    channels: Option<u32>,
-
-    #[serde(default)]
-    channel_layout: Option<String>,
-
-    #[serde(default)]
     tags: HashMap<String, String>,
 }
 
@@ -50,7 +41,7 @@ pub fn probe_audio_tracks(path: &Path) -> Result<Vec<DetectedAudioTrack>, String
         .arg("-select_streams")
         .arg("a")
         .arg("-show_entries")
-        .arg("stream=index,codec_name,sample_rate,channels,channel_layout:stream_tags=title,language")
+        .arg("stream=index,codec_name,sample_rate:stream_tags=title")
         .arg("-of")
         .arg("json")
         .arg(path)
@@ -79,8 +70,6 @@ pub fn probe_audio_tracks(path: &Path) -> Result<Vec<DetectedAudioTrack>, String
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_default();
 
-            let language = stream.tags.get("language").cloned();
-
             let sample_rate = stream
                 .sample_rate
                 .as_deref()
@@ -92,9 +81,6 @@ pub fn probe_audio_tracks(path: &Path) -> Result<Vec<DetectedAudioTrack>, String
                 title,
                 codec: stream.codec_name.unwrap_or_else(|| "unknown".to_string()),
                 sample_rate,
-                channels: stream.channels,
-                channel_layout: stream.channel_layout,
-                language,
             }
         })
         .collect();
