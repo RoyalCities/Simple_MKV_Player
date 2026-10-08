@@ -1,15 +1,23 @@
-use crate::media::{
-    audio_mixer::{AudioMixer, MixTrackConfig},
-    player::MpvPlayer,
-    tracks::probe_audio_tracks,
-    video_surface::{VideoSurface, hwnd_from_handle},
+use crate::{
+    export::ffmpeg::{
+        ExportMixTrack, export_mix_wav_with_progress, export_track_wav_with_progress,
+        export_video_mix_mkv_with_progress,
+    },
+    media::{
+        audio_mixer::{AudioMixer, MixTrackConfig},
+        player::MpvPlayer,
+        tracks::probe_audio_tracks,
+        video_surface::{VideoSurface, hwnd_from_handle},
+    },
 };
 
 use eframe::egui;
 
 use std::{
-    path::PathBuf,
-    time::{Duration, Instant},
+    path::{Path, PathBuf},
+    sync::mpsc::{self, Receiver},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 pub struct AudioTrack {
@@ -26,6 +34,29 @@ pub struct AudioTrack {
     pub gain_db: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportMode {
+    SeparateTracks,
+    MixedAudio,
+    VideoWithMix,
+}
+
+enum ExportEvent {
+    Progress { label: String, fraction: f32 },
+    Finished(Result<String, String>),
+}
+
+struct ExportProgressState {
+    label: String,
+    fraction: f32,
+}
+
+#[derive(Debug, Clone)]
+enum ExportFeedback {
+    Success(String),
+    Error(String),
+}
+
 pub struct SimpleMkvPlayer {
     current_file: Option<PathBuf>,
     tracks: Vec<AudioTrack>,
@@ -36,6 +67,15 @@ pub struct SimpleMkvPlayer {
     audio_mixer: Option<AudioMixer>,
 
     master_gain_db: f32,
+    master_name: String,
+
+    export_window_open: bool,
+    export_mode: ExportMode,
+    export_track_selection: Vec<bool>,
+
+    export_receiver: Option<Receiver<ExportEvent>>,
+    export_progress: Option<ExportProgressState>,
+    export_feedback: Option<ExportFeedback>,
 
     playing: bool,
     position: f64,
@@ -100,6 +140,15 @@ impl SimpleMkvPlayer {
             audio_mixer,
 
             master_gain_db: 0.0,
+            master_name: "Master_Mix".to_string(),
+
+            export_window_open: false,
+            export_mode: ExportMode::SeparateTracks,
+            export_track_selection: Vec::new(),
+
+            export_receiver: None,
+            export_progress: None,
+            export_feedback: None,
 
             playing: false,
             position: 0.0,
@@ -137,6 +186,354 @@ impl SimpleMkvPlayer {
         mixer.start_mix(&path, &configs, seconds)
     }
 
+    fn export_mix(&mut self) {
+        if self.export_receiver.is_some() {
+            self.status = "An export is already running.".into();
+            return;
+        }
+
+        let Some(input_path) = self.current_file.clone() else {
+            self.status = "Open a media file before exporting.".into();
+            return;
+        };
+
+        let enabled_tracks: Vec<ExportMixTrack> = self
+            .tracks
+            .iter()
+            .filter(|track| track.enabled)
+            .map(|track| ExportMixTrack {
+                audio_index: track.audio_index,
+                gain_db: track.gain_db,
+            })
+            .collect();
+
+        if enabled_tracks.is_empty() {
+            self.status = "Export Mix needs at least one enabled audio track.".into();
+            return;
+        }
+
+        let stem = source_stem(&input_path);
+        let mix_name = safe_name_or_fallback(&self.master_name, "Master_Mix");
+        let default_name = format!("{stem}_{mix_name}.wav");
+
+        let Some(output_path) = rfd::FileDialog::new()
+            .set_file_name(&default_name)
+            .add_filter("Wave Audio", &["wav"])
+            .save_file()
+        else {
+            return;
+        };
+
+        let master_gain_db = self.master_gain_db;
+        let duration = self.duration;
+        let (sender, receiver) = mpsc::channel();
+
+        self.export_feedback = None;
+        self.export_receiver = Some(receiver);
+        self.export_progress = Some(ExportProgressState {
+            label: "Exporting mix...".into(),
+            fraction: 0.0,
+        });
+        self.status = "Exporting mix...".into();
+
+        thread::spawn(move || {
+            let result = export_mix_wav_with_progress(
+                &input_path,
+                &output_path,
+                &enabled_tracks,
+                master_gain_db,
+                duration,
+                |fraction| {
+                    let _ = sender.send(ExportEvent::Progress {
+                        label: "Exporting mix...".into(),
+                        fraction,
+                    });
+                },
+            )
+            .map(|()| format!("Exported mix: {}", output_path.display()));
+
+            let _ = sender.send(ExportEvent::Finished(result));
+        });
+    }
+
+    fn export_video_with_mix(&mut self) {
+        if self.export_receiver.is_some() {
+            self.status = "An export is already running.".into();
+            return;
+        }
+
+        let Some(input_path) = self.current_file.clone() else {
+            self.status = "Open a media file before exporting.".into();
+            return;
+        };
+
+        let enabled_tracks: Vec<ExportMixTrack> = self
+            .tracks
+            .iter()
+            .filter(|track| track.enabled)
+            .map(|track| ExportMixTrack {
+                audio_index: track.audio_index,
+                gain_db: track.gain_db,
+            })
+            .collect();
+
+        if enabled_tracks.is_empty() {
+            self.status = "Video export needs at least one enabled audio track.".into();
+            return;
+        }
+
+        let stem = source_stem(&input_path);
+        let mix_name = safe_name_or_fallback(&self.master_name, "Master_Mix");
+        let default_name = format!("{stem}_{mix_name}.mkv");
+
+        let Some(output_path) = rfd::FileDialog::new()
+            .set_file_name(&default_name)
+            .add_filter("Matroska Video", &["mkv"])
+            .save_file()
+        else {
+            return;
+        };
+
+        let master_gain_db = self.master_gain_db;
+        let duration = self.duration;
+        let audio_title = Some(mix_name);
+        let (sender, receiver) = mpsc::channel();
+
+        self.export_feedback = None;
+        self.export_receiver = Some(receiver);
+        self.export_progress = Some(ExportProgressState {
+            label: "Exporting video + current mix...".into(),
+            fraction: 0.0,
+        });
+        self.status = "Exporting video + current mix...".into();
+
+        thread::spawn(move || {
+            let result = export_video_mix_mkv_with_progress(
+                &input_path,
+                &output_path,
+                &enabled_tracks,
+                master_gain_db,
+                duration,
+                audio_title.as_deref(),
+                |fraction| {
+                    let _ = sender.send(ExportEvent::Progress {
+                        label: "Exporting video + current mix...".into(),
+                        fraction,
+                    });
+                },
+            )
+            .map(|()| format!("Exported video + current mix: {}", output_path.display()));
+
+            let _ = sender.send(ExportEvent::Finished(result));
+        });
+    }
+
+    fn export_track(&mut self, track_index: usize) {
+        if self.export_receiver.is_some() {
+            self.status = "An export is already running.".into();
+            return;
+        }
+
+        let Some(input_path) = self.current_file.clone() else {
+            self.status = "Open a media file before exporting.".into();
+            return;
+        };
+
+        let Some(track) = self.tracks.get(track_index) else {
+            self.status = "Could not find the requested audio track.".into();
+            return;
+        };
+
+        let default_name = single_track_export_filename(&input_path, track);
+
+        let Some(output_path) = rfd::FileDialog::new()
+            .set_file_name(&default_name)
+            .add_filter("Wave Audio", &["wav"])
+            .save_file()
+        else {
+            return;
+        };
+
+        let audio_index = track.audio_index;
+        let gain_db = track.gain_db;
+        let number = track.number;
+        let title = nonempty_metadata(&track.name).map(str::to_owned);
+        let duration = self.duration;
+        let (sender, receiver) = mpsc::channel();
+
+        self.export_feedback = None;
+        self.export_receiver = Some(receiver);
+        self.export_progress = Some(ExportProgressState {
+            label: format!("Exporting Track {number}..."),
+            fraction: 0.0,
+        });
+        self.status = format!("Exporting Track {number}...");
+
+        thread::spawn(move || {
+            let result = export_track_wav_with_progress(
+                &input_path,
+                &output_path,
+                audio_index,
+                gain_db,
+                title.as_deref(),
+                duration,
+                |fraction| {
+                    let _ = sender.send(ExportEvent::Progress {
+                        label: format!("Exporting Track {number}..."),
+                        fraction,
+                    });
+                },
+            )
+            .map(|()| format!("Exported Track {number}: {}", output_path.display()));
+
+            let _ = sender.send(ExportEvent::Finished(result));
+        });
+    }
+
+    fn export_selected_tracks(&mut self) {
+        if self.export_receiver.is_some() {
+            self.status = "An export is already running.".into();
+            return;
+        }
+
+        let Some(input_path) = self.current_file.clone() else {
+            self.status = "Open a media file before exporting.".into();
+            return;
+        };
+
+        let selected: Vec<(usize, usize, f32, String)> = self
+            .export_track_selection
+            .iter()
+            .enumerate()
+            .filter_map(|(index, selected)| selected.then_some(index))
+            .filter_map(|index| {
+                let track = self.tracks.get(index)?;
+
+                Some((
+                    track.number,
+                    track.audio_index,
+                    track.gain_db,
+                    track.name.clone(),
+                ))
+            })
+            .collect();
+
+        if selected.is_empty() {
+            self.status = "Select at least one track to export.".into();
+            return;
+        }
+
+        let Some(output_folder) = rfd::FileDialog::new().pick_folder() else {
+            return;
+        };
+
+        let duration = self.duration;
+        let count = selected.len();
+        let source_name = source_stem(&input_path);
+        let batch_timestamp = compact_utc_timestamp();
+        let (sender, receiver) = mpsc::channel();
+
+        self.export_feedback = None;
+        self.export_receiver = Some(receiver);
+        self.export_progress = Some(ExportProgressState {
+            label: format!("Exporting Track 1 (1/{count})..."),
+            fraction: 0.0,
+        });
+        self.status = format!("Exporting {count} separate WAV tracks...");
+
+        thread::spawn(move || {
+            for (position, (number, audio_index, gain_db, name)) in selected.into_iter().enumerate()
+            {
+                let component = nonempty_metadata(&name)
+                    .map(sanitize_filename_component)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| format!("Track_{number}"));
+
+                let filename = format!("{source_name}_{component}_{batch_timestamp}.wav");
+
+                let output_path = unique_output_path(&output_folder.join(filename));
+
+                let title = nonempty_metadata(&name);
+                let base = position as f32 / count as f32;
+                let span = 1.0 / count as f32;
+                let label = format!("Exporting Track {number} ({}/{count})...", position + 1);
+
+                let result = export_track_wav_with_progress(
+                    &input_path,
+                    &output_path,
+                    audio_index,
+                    gain_db,
+                    title,
+                    duration,
+                    |track_fraction| {
+                        let overall = base + track_fraction * span;
+
+                        let _ = sender.send(ExportEvent::Progress {
+                            label: label.clone(),
+                            fraction: overall.clamp(0.0, 1.0),
+                        });
+                    },
+                );
+
+                if let Err(error) = result {
+                    let _ = sender.send(ExportEvent::Finished(Err(format!(
+                        "Batch export stopped on Track {number}: {error}"
+                    ))));
+                    return;
+                }
+            }
+
+            let _ = sender.send(ExportEvent::Finished(Ok(format!(
+                "Export complete - {count} WAV track{} saved to {}",
+                if count == 1 { "" } else { "s" },
+                output_folder.display()
+            ))));
+        });
+    }
+
+    fn poll_export(&mut self) {
+        let events: Vec<ExportEvent> = self
+            .export_receiver
+            .as_ref()
+            .map(|receiver| receiver.try_iter().collect())
+            .unwrap_or_default();
+
+        let mut finished = false;
+
+        for event in events {
+            match event {
+                ExportEvent::Progress { label, fraction } => {
+                    self.export_progress = Some(ExportProgressState {
+                        label,
+                        fraction: fraction.clamp(0.0, 1.0),
+                    });
+                }
+
+                ExportEvent::Finished(result) => {
+                    match result {
+                        Ok(message) => {
+                            self.status = message.clone();
+                            self.export_feedback = Some(ExportFeedback::Success(message));
+                        }
+
+                        Err(error) => {
+                            let message = format!("Export failed: {error}");
+                            self.status = message.clone();
+                            self.export_feedback = Some(ExportFeedback::Error(message));
+                        }
+                    }
+
+                    self.export_progress = None;
+                    finished = true;
+                }
+            }
+        }
+
+        if finished {
+            self.export_receiver = None;
+        }
+    }
+
     fn stop_mixer(&mut self) {
         if let Some(mixer) = self.audio_mixer.as_mut() {
             mixer.stop_all();
@@ -154,6 +551,7 @@ impl SimpleMkvPlayer {
 
         self.stop_mixer();
 
+        self.export_feedback = None;
         self.current_file = Some(path.clone());
 
         self.tracks.clear();
@@ -191,6 +589,8 @@ impl SimpleMkvPlayer {
                         gain_db: 0.0,
                     })
                     .collect();
+
+                self.export_track_selection = vec![true; self.tracks.len()];
             }
 
             Err(error) => {
@@ -348,6 +748,118 @@ impl SimpleMkvPlayer {
     }
 }
 
+fn nonempty_metadata(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn sanitize_filename_component(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|character| match character {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            character if character.is_control() => '_',
+            character => character,
+        })
+        .collect();
+
+    sanitized.trim().trim_end_matches(['.', ' ']).to_string()
+}
+
+fn source_stem(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|value| value.to_str())
+        .map(sanitize_filename_component)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "Recording".to_string())
+}
+
+fn safe_name_or_fallback(value: &str, fallback: &str) -> String {
+    nonempty_metadata(value)
+        .map(sanitize_filename_component)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn single_track_export_filename(input_path: &Path, track: &AudioTrack) -> String {
+    let source = source_stem(input_path);
+
+    let component = nonempty_metadata(&track.name)
+        .map(sanitize_filename_component)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("Track_{}", track.number));
+
+    format!("{source}_{component}.wav")
+}
+
+fn unique_output_path(path: &Path) -> PathBuf {
+    if !path.exists() {
+        return path.to_path_buf();
+    }
+
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("export");
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+
+    for suffix in 2usize.. {
+        let filename = if extension.is_empty() {
+            format!("{stem}_{suffix}")
+        } else {
+            format!("{stem}_{suffix}.{extension}")
+        };
+
+        let candidate = parent.join(filename);
+
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+
+    unreachable!()
+}
+
+fn compact_utc_timestamp() -> String {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let days = seconds.div_euclid(86_400);
+    let day_seconds = seconds.rem_euclid(86_400);
+
+    let hour = day_seconds / 3_600;
+    let minute = (day_seconds % 3_600) / 60;
+    let second = day_seconds % 60;
+
+    // Gregorian civil date conversion from days since Unix epoch.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+
+    if month <= 2 {
+        year += 1;
+    }
+
+    format!("{year:04}{month:02}{day:02}_{hour:02}{minute:02}{second:02}")
+}
+
 fn format_time(seconds: f64) -> String {
     if !seconds.is_finite() || seconds < 0.0 {
         return "00:00".into();
@@ -454,8 +966,9 @@ fn draw_dual_db_meters(ui: &mut egui::Ui, pre_peak_db: f32, post_peak_db: f32, e
 impl eframe::App for SimpleMkvPlayer {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_player();
+        self.poll_export();
 
-        if self.playing {
+        if self.playing || self.export_receiver.is_some() {
             ui.ctx().request_repaint_after(Duration::from_millis(50));
         }
 
@@ -468,6 +981,19 @@ impl eframe::App for SimpleMkvPlayer {
                 self.open_file();
             }
 
+            let export_button = ui.add_enabled(
+                self.current_file.is_some() && self.export_receiver.is_none(),
+                egui::Button::new("Export..."),
+            );
+
+            if export_button.clicked() {
+                if self.export_track_selection.len() != self.tracks.len() {
+                    self.export_track_selection = vec![true; self.tracks.len()];
+                }
+
+                self.export_window_open = true;
+            }
+
             ui.separator();
 
             if let Some(path) = &self.current_file {
@@ -478,6 +1004,18 @@ impl eframe::App for SimpleMkvPlayer {
         });
 
         ui.separator();
+
+        if let Some(progress) = &self.export_progress {
+            ui.horizontal(|ui| {
+                ui.label(&progress.label);
+                let width = (ui.available_width() - 12.0).max(120.0);
+                ui.add_sized(
+                    [width, 20.0],
+                    egui::ProgressBar::new(progress.fraction).show_percentage(),
+                );
+            });
+            ui.add_space(4.0);
+        }
 
         // ====================================================
         // VIDEO
@@ -585,6 +1123,9 @@ impl eframe::App for SimpleMkvPlayer {
 
         ui.add_space(4.0);
 
+        let mut export_mix_requested = false;
+        let mut export_track_requested: Option<usize> = None;
+
         let mixer = self.audio_mixer.as_ref();
 
         let (master_pre_peak_db, _master_pre_rms_db, master_post_peak_db, _master_post_rms_db) =
@@ -596,7 +1137,7 @@ impl eframe::App for SimpleMkvPlayer {
             .auto_shrink([false, true])
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    for track in &mut self.tracks {
+                    for (track_index, track) in self.tracks.iter_mut().enumerate() {
                         let (pre_peak_db, _pre_rms_db, post_peak_db, _post_rms_db) = mixer
                             .and_then(|mixer| mixer.track_levels_db(track.audio_index))
                             .unwrap_or((-60.0, -60.0, -60.0, -60.0));
@@ -672,12 +1213,14 @@ impl eframe::App for SimpleMkvPlayer {
 
                                 ui.add_space(3.0);
 
-                                if ui.button("Export WAV").clicked() {
-                                    println!(
-                                        "Export requested: audio stream {} / title {:?}",
-                                        track.audio_index,
-                                        track.name.trim(),
-                                    );
+                                if ui
+                                    .add_enabled(
+                                        self.export_receiver.is_none(),
+                                        egui::Button::new("Export WAV"),
+                                    )
+                                    .clicked()
+                                {
+                                    export_track_requested = Some(track_index);
                                 }
 
                                 ui.small(format!(
@@ -700,11 +1243,18 @@ impl eframe::App for SimpleMkvPlayer {
                         ui.vertical_centered(|ui| {
                             ui.strong("MASTER");
 
-                            // Reserved name-row height so MASTER aligns with track strips.
-                            ui.add_space(24.0);
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.master_name)
+                                    .hint_text("Master_Mix")
+                                    .desired_width(128.0),
+                            );
+
                             ui.add_space(14.0);
 
-                            ui.label("Output Bus");
+                            ui.add_sized(
+                                [128.0, ui.spacing().interact_size.y],
+                                egui::Label::new("Output Bus"),
+                            );
 
                             ui.add_space(4.0);
                             ui.small("Fader     Pre  Post");
@@ -739,8 +1289,14 @@ impl eframe::App for SimpleMkvPlayer {
 
                             ui.add_space(3.0);
 
-                            if ui.button("Export Mix").clicked() {
-                                println!("Export mix requested");
+                            if ui
+                                .add_enabled(
+                                    self.export_receiver.is_none(),
+                                    egui::Button::new("Export Mix"),
+                                )
+                                .clicked()
+                            {
+                                export_mix_requested = true;
                             }
 
                             ui.small("Final output bus");
@@ -749,12 +1305,218 @@ impl eframe::App for SimpleMkvPlayer {
                 });
             });
 
-        if !self.tracks.is_empty() {
-            ui.add_space(5.0);
+        if let Some(track_index) = export_track_requested {
+            self.export_track(track_index);
+        }
 
-            if ui.button("Export All Tracks").clicked() {
-                println!("Export all requested");
-            }
+        if export_mix_requested {
+            self.export_mix();
+        }
+
+        // ====================================================
+        // EXPORT WINDOW
+        // ====================================================
+
+        let mut export_window_open = self.export_window_open;
+        let mut export_separate_requested = false;
+        let mut export_dialog_mix_requested = false;
+        let mut export_video_mix_requested = false;
+        let mut close_export_window_requested = false;
+
+        if export_window_open {
+            egui::Window::new("Export")
+                .open(&mut export_window_open)
+                .resizable(false)
+                .collapsible(false)
+                .default_width(430.0)
+                .show(ui.ctx(), |ui| {
+                    ui.label("Choose what you want to export.");
+
+                    ui.add_space(8.0);
+
+                    ui.radio_value(
+                        &mut self.export_mode,
+                        ExportMode::SeparateTracks,
+                        "Separate audio tracks",
+                    );
+
+                    ui.radio_value(
+                        &mut self.export_mode,
+                        ExportMode::MixedAudio,
+                        "Mixed audio",
+                    );
+
+                    ui.radio_value(
+                        &mut self.export_mode,
+                        ExportMode::VideoWithMix,
+                        "Video + current mix",
+                    );
+
+                    ui.separator();
+
+                    match self.export_mode {
+                        ExportMode::SeparateTracks => {
+                            ui.label(
+                                "Exports each selected source as its own 24-bit WAV."
+                            );
+
+                            ui.small(
+                                "Track selection here is independent of the playback Enabled switches."
+                            );
+
+                            ui.add_space(6.0);
+
+                            for (index, track) in self.tracks.iter().enumerate() {
+                                if index >= self.export_track_selection.len() {
+                                    break;
+                                }
+
+                                let title = nonempty_metadata(&track.name)
+                                    .unwrap_or("(Track name)");
+
+                                ui.checkbox(
+                                    &mut self.export_track_selection[index],
+                                    format!("Track {}  -  {title}", track.number),
+                                );
+                            }
+                        }
+
+                        ExportMode::MixedAudio => {
+                            ui.label("Exports the current post-master mix as a 24-bit WAV.");
+
+                            ui.small(
+                                "What you hear is what you get: enabled tracks, track gains, and master gain."
+                            );
+
+                            ui.add_space(6.0);
+
+                            let enabled_count =
+                                self.tracks.iter().filter(|track| track.enabled).count();
+
+                            ui.label(format!(
+                                "{enabled_count} enabled track{}",
+                                if enabled_count == 1 { "" } else { "s" }
+                            ));
+
+                            ui.label(format!(
+                                "Master gain: {:+.1} dB",
+                                self.master_gain_db
+                            ));
+                        }
+
+                        ExportMode::VideoWithMix => {
+                            ui.label(
+                                "Exports the original video with the current post-master mix."
+                            );
+
+                            ui.add_space(6.0);
+
+                            ui.label("Video:");
+                            ui.small("Copy source stream (no video re-encode)");
+                            ui.small(
+                                "Resolution, frame rate, and video quality are preserved."
+                            );
+
+                            ui.add_space(6.0);
+
+                            ui.label("Audio:");
+                            ui.small("AAC 320 kbps stereo");
+                            ui.small(
+                                "Enabled tracks, track gains, and Master gain are applied."
+                            );
+
+                            ui.add_space(6.0);
+
+                            let enabled_count =
+                                self.tracks.iter().filter(|track| track.enabled).count();
+
+                            ui.label(format!(
+                                "{enabled_count} enabled track{}",
+                                if enabled_count == 1 { "" } else { "s" }
+                            ));
+
+                            ui.label(format!(
+                                "Master gain: {:+.1} dB",
+                                self.master_gain_db
+                            ));
+                        }
+                    }
+
+                    ui.add_space(10.0);
+                    ui.separator();
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            close_export_window_requested = true;
+                        }
+
+                        let export_label = match self.export_mode {
+                            ExportMode::SeparateTracks => "Export WAVs",
+                            ExportMode::MixedAudio => "Export Mix",
+                            ExportMode::VideoWithMix => "Export Video",
+                        };
+
+                        if ui
+                            .add_enabled(
+                                self.export_receiver.is_none(),
+                                egui::Button::new(export_label),
+                            )
+                            .clicked()
+                        {
+                            match self.export_mode {
+                                ExportMode::SeparateTracks => {
+                                    export_separate_requested = true;
+                                }
+
+                                ExportMode::MixedAudio => {
+                                    export_dialog_mix_requested = true;
+                                }
+
+                                ExportMode::VideoWithMix => {
+                                    export_video_mix_requested = true;
+                                }
+                            }
+                        }
+                    });
+
+                    if let Some(feedback) = &self.export_feedback {
+                        ui.add_space(8.0);
+
+                        match feedback {
+                            ExportFeedback::Success(message) => {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(70, 200, 100),
+                                    format!("✓ {message}"),
+                                );
+                            }
+
+                            ExportFeedback::Error(message) => {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(220, 80, 75),
+                                    format!("✕ {message}"),
+                                );
+                            }
+                        }
+                    }
+                });
+        }
+
+        if close_export_window_requested {
+            export_window_open = false;
+        }
+
+        self.export_window_open = export_window_open;
+
+        if export_separate_requested {
+            self.export_selected_tracks();
+        }
+
+        if export_dialog_mix_requested {
+            self.export_mix();
+        }
+
+        if export_video_mix_requested {
+            self.export_video_with_mix();
         }
     }
 }

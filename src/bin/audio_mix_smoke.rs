@@ -91,7 +91,7 @@ fn main() {
         configs.push(MixTrackConfig {
             audio_index: track.audio_index,
 
-            volume: 1.0,
+            gain_db: 0.0,
 
             enabled: true,
         });
