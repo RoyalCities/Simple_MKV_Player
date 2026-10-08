@@ -23,6 +23,62 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+fn accent_color() -> egui::Color32 {
+    // Match the PRE meter blue exactly.
+    egui::Color32::from_rgb(112, 205, 255)
+}
+
+fn accent_soft() -> egui::Color32 {
+    egui::Color32::from_rgb(35, 82, 125)
+}
+
+fn post_meter_green() -> egui::Color32 {
+    egui::Color32::from_rgb(65, 204, 126)
+}
+
+fn muted_text() -> egui::Color32 {
+    egui::Color32::from_rgb(145, 154, 168)
+}
+
+fn apply_studio_style(ctx: &egui::Context) {
+    ctx.style_mut_of(egui::Theme::Dark, |style| {
+        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+        style.spacing.button_padding = egui::vec2(11.0, 5.0);
+
+        let visuals = &mut style.visuals;
+
+        visuals.panel_fill = egui::Color32::from_rgb(10, 13, 18);
+        visuals.window_fill = egui::Color32::from_rgb(14, 18, 24);
+        visuals.extreme_bg_color = egui::Color32::from_rgb(5, 8, 12);
+        visuals.faint_bg_color = egui::Color32::from_rgb(18, 23, 31);
+
+        visuals.override_text_color = Some(egui::Color32::from_rgb(220, 226, 235));
+
+        visuals.selection.bg_fill = accent_soft();
+        visuals.selection.stroke = egui::Stroke::new(1.0, accent_color());
+
+        visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(14, 18, 24);
+        visuals.widgets.noninteractive.bg_stroke =
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 57, 70));
+        visuals.widgets.noninteractive.fg_stroke =
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(185, 194, 207));
+
+        visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(27, 34, 44);
+        visuals.widgets.inactive.bg_stroke =
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(54, 64, 79));
+        visuals.widgets.inactive.fg_stroke =
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(205, 213, 224));
+
+        visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(39, 52, 68);
+        visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, accent_color());
+        visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.2, egui::Color32::WHITE);
+
+        visuals.widgets.active.bg_fill = accent_soft();
+        visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, accent_color());
+        visuals.widgets.active.fg_stroke = egui::Stroke::new(1.2, egui::Color32::WHITE);
+    });
+}
+
 pub struct AudioTrack {
     pub number: usize,
     pub audio_index: usize,
@@ -426,8 +482,7 @@ impl SimpleMkvPlayer {
                 egui::pos2(rail_rect.left() + filled_width, rail_rect.bottom()),
             );
 
-            ui.painter()
-                .rect_filled(filled_rect, 2.0, egui::Color32::WHITE);
+            ui.painter().rect_filled(filled_rect, 2.0, accent_color());
         }
 
         let knob_x = rail_rect.left() + filled_width;
@@ -497,7 +552,14 @@ impl SimpleMkvPlayer {
         ui.painter().circle_stroke(
             play_center,
             play_radius,
-            egui::Stroke::new(1.0, egui::Color32::from_white_alpha(190)),
+            egui::Stroke::new(
+                1.0,
+                if play_response.hovered() {
+                    accent_color()
+                } else {
+                    egui::Color32::from_white_alpha(190)
+                },
+            ),
         );
 
         let play_text = if self.playing { "Ⅱ" } else { "▶" };
@@ -1271,22 +1333,22 @@ fn meter_fraction(db: f32) -> f32 {
 fn meter_fill_color(db: f32, enabled: bool, is_post: bool) -> egui::Color32 {
     if !enabled {
         if is_post {
-            return egui::Color32::from_rgb(85, 85, 85);
+            return egui::Color32::from_rgb(54, 61, 72);
         }
 
-        return egui::Color32::from_rgb(95, 95, 105);
+        return egui::Color32::from_rgb(69, 79, 94);
     }
 
     if is_post {
         if db > -3.0 {
-            egui::Color32::from_rgb(220, 70, 65)
+            egui::Color32::from_rgb(245, 92, 92)
         } else if db > -12.0 {
-            egui::Color32::from_rgb(220, 185, 55)
+            egui::Color32::from_rgb(245, 196, 81)
         } else {
-            egui::Color32::from_rgb(52, 190, 90)
+            post_meter_green()
         }
     } else {
-        egui::Color32::from_rgb(170, 225, 255)
+        egui::Color32::from_rgb(112, 205, 255)
     }
 }
 
@@ -1297,7 +1359,7 @@ fn draw_single_meter(
     enabled: bool,
     is_post: bool,
 ) {
-    painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(15, 15, 15));
+    painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(7, 10, 14));
 
     let fraction = meter_fraction(db);
 
@@ -1393,6 +1455,8 @@ fn draw_dual_db_meters(ui: &mut egui::Ui, pre_peak_db: f32, post_peak_db: f32, e
 
 impl eframe::App for SimpleMkvPlayer {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        apply_studio_style(ui.ctx());
+
         self.poll_player();
         self.poll_export();
 
@@ -1481,15 +1545,24 @@ impl eframe::App for SimpleMkvPlayer {
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if let Some(path) = &self.current_file {
-                    ui.label(path.file_name().unwrap_or_default().to_string_lossy());
-                } else {
-                    ui.label("No file loaded");
-                }
+                let filename = self
+                    .current_file
+                    .as_ref()
+                    .map(|path| {
+                        path.file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .unwrap_or_else(|| "No file loaded".to_string());
+
+                ui.label(egui::RichText::new(filename).size(12.0).color(muted_text()));
             });
         });
 
+        ui.add_space(4.0);
         ui.separator();
+        ui.add_space(4.0);
 
         if let Some(progress) = &self.export_progress {
             ui.horizontal(|ui| {
@@ -1551,7 +1624,8 @@ impl eframe::App for SimpleMkvPlayer {
             egui::Sense::click(),
         );
 
-        ui.painter().rect_filled(rect, 4.0, egui::Color32::BLACK);
+        ui.painter()
+            .rect_filled(rect, 4.0, egui::Color32::from_rgb(3, 5, 8));
 
         if self.current_file.is_none() {
             ui.painter().text(
@@ -1601,9 +1675,9 @@ impl eframe::App for SimpleMkvPlayer {
             egui::Stroke::new(
                 2.0,
                 if resize_response.hovered() || resize_response.dragged() {
-                    egui::Color32::from_gray(145)
+                    accent_color()
                 } else {
-                    egui::Color32::from_gray(70)
+                    egui::Color32::from_rgb(55, 64, 76)
                 },
             ),
         );
@@ -1642,14 +1716,29 @@ impl eframe::App for SimpleMkvPlayer {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.vertical_centered(|ui| {
-                    ui.heading("Mixer");
+                    ui.label(
+                        egui::RichText::new("MIXER")
+                            .strong()
+                            .size(16.0)
+                            .color(accent_color()),
+                    );
 
                     if !self.status.trim().is_empty() {
-                        ui.small(&self.status);
+                        ui.label(
+                            egui::RichText::new(&self.status)
+                                .size(10.0)
+                                .color(muted_text()),
+                        );
+                    } else {
+                        ui.label(
+                            egui::RichText::new("MULTI-TRACK MONITOR")
+                                .size(9.0)
+                                .color(muted_text()),
+                        );
                     }
                 });
 
-                ui.add_space(4.0);
+                ui.add_space(8.0);
 
                 let mixer = self.audio_mixer.as_ref();
 
@@ -1701,7 +1790,12 @@ impl eframe::App for SimpleMkvPlayer {
                                     ui.set_max_width(mixer_channel_width);
 
                                     ui.vertical_centered(|ui| {
-                                        ui.strong(format!("Track {}", track.number));
+                                        ui.label(
+                                            egui::RichText::new(format!("TRACK {}", track.number))
+                                                .strong()
+                                                .size(13.0)
+                                                .color(accent_color()),
+                                        );
 
                                         let name_response = ui.add(
                                             egui::TextEdit::singleline(&mut track.name)
@@ -1775,7 +1869,14 @@ impl eframe::App for SimpleMkvPlayer {
                                             );
                                         });
 
-                                        ui.label(format!("{:+.1} dB", track.gain_db));
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{:+.1} dB",
+                                                track.gain_db
+                                            ))
+                                            .strong()
+                                            .size(13.0),
+                                        );
                                         ui.small(format!("Pre  {:>5.1} dB", pre_peak_db));
                                         ui.small(format!("Post {:>5.1} dB", post_peak_db));
 
@@ -1791,12 +1892,16 @@ impl eframe::App for SimpleMkvPlayer {
                                             export_track_requested = Some(track_index);
                                         }
 
-                                        ui.small(format!(
-                                            "{} / {} Hz / #{}",
-                                            track.codec.to_uppercase(),
-                                            track.sample_rate.unwrap_or(0),
-                                            track.stream_index
-                                        ));
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{} · {} Hz · #{}",
+                                                track.codec.to_uppercase(),
+                                                track.sample_rate.unwrap_or(0),
+                                                track.stream_index,
+                                            ))
+                                            .size(9.0)
+                                            .color(muted_text()),
+                                        );
                                     });
                                 });
 
@@ -1809,7 +1914,12 @@ impl eframe::App for SimpleMkvPlayer {
                                 ui.set_max_width(mixer_channel_width);
 
                                 ui.vertical_centered(|ui| {
-                                    ui.strong("MASTER");
+                                    ui.label(
+                                        egui::RichText::new("MASTER")
+                                            .strong()
+                                            .size(13.0)
+                                            .color(post_meter_green()),
+                                    );
 
                                     ui.add(
                                         egui::TextEdit::singleline(&mut self.master_name)
@@ -1863,7 +1973,14 @@ impl eframe::App for SimpleMkvPlayer {
                                         );
                                     });
 
-                                    ui.label(format!("{:+.1} dB", self.master_gain_db));
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{:+.1} dB",
+                                            self.master_gain_db,
+                                        ))
+                                        .strong()
+                                        .size(13.0),
+                                    );
                                     ui.small(format!("Pre  {:>5.1} dB", master_pre_peak_db));
                                     ui.small(format!("Post {:>5.1} dB", master_post_peak_db));
 
@@ -1879,7 +1996,11 @@ impl eframe::App for SimpleMkvPlayer {
                                         export_mix_requested = true;
                                     }
 
-                                    ui.small("Final output bus");
+                                    ui.label(
+                                        egui::RichText::new("FINAL OUTPUT BUS")
+                                            .size(9.0)
+                                            .color(muted_text()),
+                                    );
                                 });
                             });
                         });
@@ -1911,7 +2032,21 @@ impl eframe::App for SimpleMkvPlayer {
                 .collapsible(false)
                 .default_width(430.0)
                 .show(ui.ctx(), |ui| {
-                    ui.label("Choose what you want to export.");
+                    ui.label(
+                        egui::RichText::new(
+                            "Choose an export workflow",
+                        )
+                        .strong()
+                        .size(14.0),
+                    );
+
+                    ui.label(
+                        egui::RichText::new(
+                            "Audio processing always follows the mixer state shown in the main window.",
+                        )
+                        .size(10.0)
+                        .color(muted_text()),
+                    );
 
                     ui.add_space(8.0);
 
