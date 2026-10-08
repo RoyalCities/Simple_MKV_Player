@@ -223,7 +223,7 @@ impl SimpleMkvPlayer {
             duration: 0.0,
             video_fullscreen: false,
             last_video_interaction: Instant::now(),
-            video_split_ratio: None,
+            video_split_ratio: Some(0.0),
 
             status,
             last_poll: Instant::now(),
@@ -1008,6 +1008,11 @@ impl SimpleMkvPlayer {
         self.position = 0.0;
         self.duration = 0.0;
 
+        // New videos start with the video pane at the smallest height
+        // permitted by the current responsive layout. The 0.0 ratio is
+        // clamped to min_video_height when the UI is drawn.
+        self.video_split_ratio = Some(0.0);
+
         match probe_audio_tracks(&path) {
             Ok(detected) => {
                 self.tracks = detected
@@ -1714,6 +1719,11 @@ impl eframe::App for SimpleMkvPlayer {
             .id_salt("mixer_vertical_scroll")
             .max_height(mixer_available_height)
             .auto_shrink([false, false])
+            // Let the mixer channel strip own the mouse wheel. The outer
+            // vertical area can still be moved with its scrollbar when the
+            // window is unusually short, but it will no longer consume wheel
+            // input before the nested horizontal track scroller sees it.
+            .scroll_source(egui::containers::scroll_area::ScrollSource::SCROLL_BAR)
             .show(ui, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.label(
@@ -1774,6 +1784,7 @@ impl eframe::App for SimpleMkvPlayer {
                 let mixer_leading_space = ((mixer_view_width - mixer_content_width) / 2.0).max(0.0);
 
                 egui::ScrollArea::horizontal()
+                    .id_salt("mixer_horizontal_scroll")
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
