@@ -1719,11 +1719,6 @@ impl eframe::App for SimpleMkvPlayer {
             .id_salt("mixer_vertical_scroll")
             .max_height(mixer_available_height)
             .auto_shrink([false, false])
-            // Let the mixer channel strip own the mouse wheel. The outer
-            // vertical area can still be moved with its scrollbar when the
-            // window is unusually short, but it will no longer consume wheel
-            // input before the nested horizontal track scroller sees it.
-            .scroll_source(egui::containers::scroll_area::ScrollSource::SCROLL_BAR)
             .show(ui, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.label(
@@ -1784,7 +1779,6 @@ impl eframe::App for SimpleMkvPlayer {
                 let mixer_leading_space = ((mixer_view_width - mixer_content_width) / 2.0).max(0.0);
 
                 egui::ScrollArea::horizontal()
-                    .id_salt("mixer_horizontal_scroll")
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
