@@ -7,7 +7,7 @@ use crate::{
         audio_mixer::{AudioMixer, MixTrackConfig},
         player::MpvPlayer,
         tracks::probe_audio_tracks,
-        video_surface::{VideoSurface, hwnd_from_handle},
+        video_surface::VideoSurface,
     },
 };
 
@@ -15,7 +15,10 @@ use eframe::egui;
 
 use std::{
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -80,6 +83,9 @@ pub struct SimpleMkvPlayer {
     playing: bool,
     position: f64,
     duration: f64,
+    video_fullscreen: bool,
+    last_video_interaction: Instant,
+    video_height_override: Option<f32>,
 
     status: String,
     last_poll: Instant,
@@ -91,31 +97,37 @@ impl SimpleMkvPlayer {
 
         let mut status = "Open an MKV file.".to_string();
 
-        let video_surface = match hwnd_from_handle(cc) {
-            Ok(parent_hwnd) => match VideoSurface::new(parent_hwnd) {
-                Ok(surface) => {
-                    let hwnd = surface.hwnd() as isize;
+        let video_surface = match cc.get_proc_address.clone() {
+            Some(get_proc_address) => {
+                let repaint_context = cc.egui_ctx.clone();
 
-                    match player.set_video_hwnd(hwnd) {
-                        Ok(()) => Some(surface),
+                let request_repaint: Arc<dyn Fn() + Send + Sync + 'static> = Arc::new(move || {
+                    repaint_context.request_repaint();
+                });
 
-                        Err(error) => {
-                            status = format!("Video initialization failed: {error}");
+                match player.initialize_render(get_proc_address, request_repaint) {
+                    Ok(()) => match player.render_handle() {
+                        Some(render) => Some(VideoSurface::new(render)),
 
-                            Some(surface)
+                        None => {
+                            status = "Video renderer initialized without a render handle.".into();
+
+                            None
                         }
+                    },
+
+                    Err(error) => {
+                        status = format!("Video initialization failed: {error}");
+
+                        None
                     }
                 }
+            }
 
-                Err(error) => {
-                    status = format!("Could not create video surface: {error}");
-
-                    None
-                }
-            },
-
-            Err(error) => {
-                status = format!("Could not obtain application HWND: {error}");
+            None => {
+                status =
+                    "OpenGL renderer unavailable. Simple MKV Player now requires the eframe Glow backend."
+                        .into();
 
                 None
             }
@@ -153,10 +165,227 @@ impl SimpleMkvPlayer {
             playing: false,
             position: 0.0,
             duration: 0.0,
+            video_fullscreen: false,
+            last_video_interaction: Instant::now(),
+            video_height_override: None,
 
             status,
             last_poll: Instant::now(),
         }
+    }
+
+    fn set_video_fullscreen(&mut self, ctx: &egui::Context, fullscreen: bool) {
+        self.video_fullscreen = fullscreen;
+
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(fullscreen));
+
+        ctx.request_repaint();
+    }
+
+    fn draw_video_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        fullscreen: bool,
+    ) -> bool {
+        let pointer_pos = ui.input(|input| input.pointer.hover_pos());
+
+        let pointer_delta = ui.input(|input| input.pointer.delta());
+
+        let pointer_over_video = pointer_pos
+            .map(|position| rect.contains(position))
+            .unwrap_or(false);
+
+        if pointer_over_video && pointer_delta.length_sq() > 0.0 {
+            self.last_video_interaction = Instant::now();
+        }
+
+        let controls_visible = pointer_over_video
+            && self.last_video_interaction.elapsed() < Duration::from_millis(1800);
+
+        if !controls_visible {
+            return false;
+        }
+
+        // A paused frame still needs repainting so the controls can
+        // disappear after the inactivity timeout.
+        ui.ctx().request_repaint_after(Duration::from_millis(100));
+
+        let band_height = if fullscreen { 84.0 } else { 76.0 };
+
+        let band_rect = egui::Rect::from_min_max(
+            egui::pos2(rect.left(), (rect.bottom() - band_height).max(rect.top())),
+            rect.right_bottom(),
+        );
+
+        // Slight gradient-like effect using two translucent layers.
+        ui.painter()
+            .rect_filled(band_rect, 0.0, egui::Color32::from_black_alpha(125));
+
+        let lower_band = egui::Rect::from_min_max(
+            egui::pos2(band_rect.left(), band_rect.center().y),
+            band_rect.right_bottom(),
+        );
+
+        ui.painter()
+            .rect_filled(lower_band, 0.0, egui::Color32::from_black_alpha(65));
+
+        // ----------------------------------------------------
+        // SCRUB RAIL
+        // ----------------------------------------------------
+
+        let horizontal_margin = if fullscreen { 48.0 } else { 28.0 };
+
+        let rail_y = band_rect.top() + 18.0;
+
+        let scrub_rect = egui::Rect::from_min_max(
+            egui::pos2(band_rect.left() + horizontal_margin, rail_y - 10.0),
+            egui::pos2(band_rect.right() - horizontal_margin, rail_y + 10.0),
+        );
+
+        let scrub_response = ui.interact(
+            scrub_rect,
+            ui.make_persistent_id("video_scrub_bar"),
+            egui::Sense::click_and_drag(),
+        );
+
+        let rail_rect =
+            egui::Rect::from_center_size(scrub_rect.center(), egui::vec2(scrub_rect.width(), 4.0));
+
+        ui.painter()
+            .rect_filled(rail_rect, 2.0, egui::Color32::from_white_alpha(70));
+
+        let maximum = self.duration.max(0.0);
+
+        let fraction = if maximum > 0.0 {
+            (self.position / maximum).clamp(0.0, 1.0) as f32
+        } else {
+            0.0
+        };
+
+        let filled_width = rail_rect.width() * fraction;
+
+        if filled_width > 0.0 {
+            let filled_rect = egui::Rect::from_min_max(
+                rail_rect.min,
+                egui::pos2(rail_rect.left() + filled_width, rail_rect.bottom()),
+            );
+
+            ui.painter()
+                .rect_filled(filled_rect, 2.0, egui::Color32::WHITE);
+        }
+
+        let knob_x = rail_rect.left() + filled_width;
+
+        let knob_radius = if scrub_response.hovered() || scrub_response.dragged() {
+            6.0
+        } else {
+            4.5
+        };
+
+        ui.painter().circle_filled(
+            egui::pos2(knob_x, rail_rect.center().y),
+            knob_radius,
+            egui::Color32::WHITE,
+        );
+
+        let scrub_is_active = scrub_response.clicked() || scrub_response.dragged();
+
+        if scrub_is_active && maximum > 0.0 {
+            if let Some(position) = ui.input(|input| input.pointer.interact_pos()) {
+                let fraction =
+                    ((position.x - rail_rect.left()) / rail_rect.width()).clamp(0.0, 1.0);
+
+                let target = maximum * fraction as f64;
+
+                self.position = target;
+                self.last_video_interaction = Instant::now();
+
+                if scrub_response.clicked() {
+                    self.seek_to(target);
+                }
+            }
+        }
+
+        if scrub_response.drag_stopped() && maximum > 0.0 {
+            self.seek_to(self.position);
+        }
+
+        // ----------------------------------------------------
+        // CENTER PLAY / PAUSE
+        // ----------------------------------------------------
+
+        let play_center = egui::pos2(band_rect.center().x, band_rect.bottom() - 25.0);
+
+        let play_radius = if fullscreen { 18.0 } else { 16.0 };
+
+        let play_rect = egui::Rect::from_center_size(
+            play_center,
+            egui::vec2(play_radius * 2.0, play_radius * 2.0),
+        );
+
+        let play_response = ui.interact(
+            play_rect,
+            ui.make_persistent_id("video_play_pause"),
+            egui::Sense::click(),
+        );
+
+        let play_fill = if play_response.hovered() {
+            egui::Color32::from_white_alpha(55)
+        } else {
+            egui::Color32::from_white_alpha(28)
+        };
+
+        ui.painter()
+            .circle_filled(play_center, play_radius, play_fill);
+
+        ui.painter().circle_stroke(
+            play_center,
+            play_radius,
+            egui::Stroke::new(1.0, egui::Color32::from_white_alpha(190)),
+        );
+
+        let play_text = if self.playing { "Ⅱ" } else { "▶" };
+
+        ui.painter().text(
+            play_center,
+            egui::Align2::CENTER_CENTER,
+            play_text,
+            egui::FontId::proportional(16.0),
+            egui::Color32::WHITE,
+        );
+
+        if play_response.clicked() {
+            self.last_video_interaction = Instant::now();
+            self.toggle_playback();
+        }
+
+        // ----------------------------------------------------
+        // TIME — isolated in the bottom-right so long durations
+        // can never collide with the scrub rail.
+        // ----------------------------------------------------
+
+        let time_text = format!(
+            "{} / {}",
+            format_time(self.position),
+            format_time(self.duration),
+        );
+
+        let time_pos = egui::pos2(band_rect.right() - 16.0, band_rect.bottom() - 25.0);
+
+        ui.painter().text(
+            time_pos,
+            egui::Align2::RIGHT_CENTER,
+            time_text,
+            egui::FontId::monospace(12.0),
+            egui::Color32::WHITE,
+        );
+
+        // The whole bottom band owns pointer input while visible,
+        // so video click/double-click gestures don't fire through it.
+        pointer_pos
+            .map(|position| band_rect.contains(position))
+            .unwrap_or(false)
     }
 
     fn mix_configs(&self) -> Vec<MixTrackConfig> {
@@ -972,6 +1201,64 @@ impl eframe::App for SimpleMkvPlayer {
             ui.ctx().request_repaint_after(Duration::from_millis(50));
         }
 
+        let escape_pressed = ui.input(|input| input.key_pressed(egui::Key::Escape));
+
+        if self.video_fullscreen && escape_pressed {
+            self.set_video_fullscreen(ui.ctx(), false);
+        }
+
+        let f_pressed = ui.input(|input| input.key_pressed(egui::Key::F));
+
+        let keyboard_is_typing = ui.ctx().egui_wants_keyboard_input();
+
+        if f_pressed && !keyboard_is_typing {
+            self.set_video_fullscreen(ui.ctx(), !self.video_fullscreen);
+        }
+
+        let space_pressed = ui.input(|input| input.key_pressed(egui::Key::Space));
+
+        if space_pressed && !keyboard_is_typing && self.current_file.is_some() {
+            self.toggle_playback();
+        }
+
+        if self.video_fullscreen {
+            let available = ui.available_size();
+
+            let (rect, response) = ui.allocate_exact_size(available, egui::Sense::click());
+
+            ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
+
+            if self.current_file.is_some() {
+                if let Some(surface) = &self.video_surface {
+                    surface.paint(ui, rect);
+                }
+            } else {
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "Open an MKV file",
+                    egui::FontId::proportional(20.0),
+                    egui::Color32::GRAY,
+                );
+            }
+
+            let controls_consumed_pointer = self.draw_video_controls(ui, rect, true);
+
+            if !controls_consumed_pointer {
+                if response.double_clicked() {
+                    self.last_video_interaction = Instant::now();
+
+                    self.set_video_fullscreen(ui.ctx(), false);
+                } else if response.clicked() && self.current_file.is_some() {
+                    self.last_video_interaction = Instant::now();
+
+                    self.toggle_playback();
+                }
+            }
+
+            return;
+        }
+
         // ====================================================
         // TOP BAR
         // ====================================================
@@ -1023,11 +1310,18 @@ impl eframe::App for SimpleMkvPlayer {
 
         let available_width = ui.available_width();
 
-        let video_height = (available_width * 9.0 / 16.0).min(ui.available_height() * 0.40);
+        let default_video_height = (available_width * 9.0 / 16.0).min(ui.available_height() * 0.40);
 
-        let (rect, _) = ui.allocate_exact_size(
+        let max_video_height = (ui.available_height() * 0.75).max(180.0);
+
+        let video_height = self
+            .video_height_override
+            .unwrap_or(default_video_height)
+            .clamp(180.0, max_video_height);
+
+        let (rect, video_response) = ui.allocate_exact_size(
             egui::vec2(available_width, video_height),
-            egui::Sense::hover(),
+            egui::Sense::click(),
         );
 
         ui.painter().rect_filled(rect, 4.0, egui::Color32::BLACK);
@@ -1042,70 +1336,66 @@ impl eframe::App for SimpleMkvPlayer {
             );
         }
 
-        if let Some(surface) = &self.video_surface {
-            let scale = ui.ctx().pixels_per_point();
+        if self.current_file.is_some() {
+            if let Some(surface) = &self.video_surface {
+                surface.paint(ui, rect);
+            }
 
-            let x = (rect.min.x * scale).round() as i32;
+            let controls_consumed_pointer = self.draw_video_controls(ui, rect, false);
 
-            let y = (rect.min.y * scale).round() as i32;
+            if !controls_consumed_pointer {
+                if video_response.double_clicked() {
+                    self.last_video_interaction = Instant::now();
 
-            let width = (rect.width() * scale).round() as i32;
+                    self.set_video_fullscreen(ui.ctx(), true);
+                } else if video_response.clicked() {
+                    self.last_video_interaction = Instant::now();
 
-            let height = (rect.height() * scale).round() as i32;
-
-            surface.set_rect(x, y, width, height);
-
-            if self.current_file.is_some() {
-                surface.show();
-            } else {
-                surface.hide();
+                    self.toggle_playback();
+                }
             }
         }
 
-        ui.add_space(6.0);
+        let (resize_rect, resize_response) =
+            ui.allocate_exact_size(egui::vec2(available_width, 9.0), egui::Sense::drag());
 
-        // ====================================================
-        // TRANSPORT + FULL WIDTH SEEK
-        // ====================================================
+        let resize_response = resize_response
+            .on_hover_cursor(egui::CursorIcon::ResizeVertical)
+            .on_hover_text("Drag to resize the video pane. Double-click to reset.");
 
-        ui.horizontal(|ui| {
-            let label = if self.playing { "Pause" } else { "Play" };
+        let grip_width = 42.0;
+        let grip_y = resize_rect.center().y;
 
-            if ui.button(label).clicked() {
-                self.toggle_playback();
-            }
-
-            ui.separator();
-
-            ui.label(format!(
-                "{} / {}",
-                format_time(self.position),
-                format_time(self.duration)
-            ));
-        });
-
-        let maximum = if self.duration > 0.0 {
-            self.duration
-        } else {
-            1.0
-        };
-
-        let mut scrub = self.position.clamp(0.0, maximum);
-
-        let scrub_width = ui.available_width();
-
-        let scrub_response = ui.add_sized(
-            [scrub_width, 24.0],
-            egui::Slider::new(&mut scrub, 0.0..=maximum).show_value(false),
+        ui.painter().line_segment(
+            [
+                egui::pos2(resize_rect.center().x - grip_width / 2.0, grip_y),
+                egui::pos2(resize_rect.center().x + grip_width / 2.0, grip_y),
+            ],
+            egui::Stroke::new(
+                2.0,
+                if resize_response.hovered() || resize_response.dragged() {
+                    egui::Color32::from_gray(145)
+                } else {
+                    egui::Color32::from_gray(70)
+                },
+            ),
         );
 
-        if scrub_response.changed() {
-            self.position = scrub;
+        if resize_response.double_clicked() {
+            self.video_height_override = None;
+            ui.ctx().request_repaint();
+        } else if resize_response.dragged() {
+            let delta_y = ui.input(|input| input.pointer.delta().y);
+
+            let current_height = self.video_height_override.unwrap_or(video_height);
+
+            self.video_height_override =
+                Some((current_height + delta_y).clamp(180.0, max_video_height));
+
+            ui.ctx().request_repaint();
         }
 
-        if scrub_response.drag_stopped() {
-            self.seek_to(scrub);
-        }
+        ui.add_space(2.0);
 
         ui.separator();
 
@@ -1113,196 +1403,214 @@ impl eframe::App for SimpleMkvPlayer {
         // MIXER
         // ====================================================
 
-        ui.horizontal(|ui| {
-            ui.heading("Mixer");
-
-            ui.separator();
-
-            ui.label(&self.status);
-        });
-
-        ui.add_space(4.0);
-
         let mut export_mix_requested = false;
         let mut export_track_requested: Option<usize> = None;
 
-        let mixer = self.audio_mixer.as_ref();
+        let mixer_available_height = ui.available_height().max(80.0);
 
-        let (master_pre_peak_db, _master_pre_rms_db, master_post_peak_db, _master_post_rms_db) =
-            mixer
-                .map(|mixer| mixer.master_levels_db())
-                .unwrap_or((-60.0, -60.0, -60.0, -60.0));
-
-        egui::ScrollArea::horizontal()
-            .auto_shrink([false, true])
+        egui::ScrollArea::vertical()
+            .id_salt("mixer_vertical_scroll")
+            .max_height(mixer_available_height)
+            .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    for (track_index, track) in self.tracks.iter_mut().enumerate() {
-                        let (pre_peak_db, _pre_rms_db, post_peak_db, _post_rms_db) = mixer
-                            .and_then(|mixer| mixer.track_levels_db(track.audio_index))
-                            .unwrap_or((-60.0, -60.0, -60.0, -60.0));
+                    ui.heading("Mixer");
 
-                        ui.group(|ui| {
-                            ui.set_min_width(150.0);
-                            ui.set_max_width(150.0);
+                    ui.separator();
 
-                            ui.vertical_centered(|ui| {
-                                ui.strong(format!("Track {}", track.number));
+                    ui.label(&self.status);
+                });
 
-                                let name_response = ui.add(
-                                    egui::TextEdit::singleline(&mut track.name)
-                                        .hint_text("(Track name)")
-                                        .desired_width(128.0),
-                                );
+                ui.add_space(4.0);
 
-                                let name_chars = track.name.chars().count();
+                let mixer = self.audio_mixer.as_ref();
 
-                                if name_response.has_focus() || name_chars > 64 {
-                                    let count_text = format!("{name_chars}/64");
+                let (
+                    master_pre_peak_db,
+                    _master_pre_rms_db,
+                    master_post_peak_db,
+                    _master_post_rms_db,
+                ) = mixer
+                    .map(|mixer| mixer.master_levels_db())
+                    .unwrap_or((-60.0, -60.0, -60.0, -60.0));
 
-                                    if name_chars > 64 {
-                                        ui.colored_label(egui::Color32::YELLOW, count_text);
-                                    } else {
-                                        ui.small(count_text);
-                                    }
-                                } else {
-                                    ui.add_space(14.0);
-                                }
+                egui::ScrollArea::horizontal()
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            for (track_index, track) in self.tracks.iter_mut().enumerate() {
+                                let (pre_peak_db, _pre_rms_db, post_peak_db, _post_rms_db) = mixer
+                                    .and_then(|mixer| mixer.track_levels_db(track.audio_index))
+                                    .unwrap_or((-60.0, -60.0, -60.0, -60.0));
 
-                                let enabled = ui.checkbox(&mut track.enabled, "Enabled");
+                                ui.group(|ui| {
+                                    ui.set_min_width(150.0);
+                                    ui.set_max_width(150.0);
 
-                                if enabled.changed() {
-                                    if let Some(mixer) = mixer {
-                                        mixer.set_track_enabled(track.audio_index, track.enabled);
-                                    }
-                                }
+                                    ui.vertical_centered(|ui| {
+                                        ui.strong(format!("Track {}", track.number));
 
-                                ui.add_space(4.0);
-                                ui.small("Fader     Pre  Post");
+                                        let name_response = ui.add(
+                                            egui::TextEdit::singleline(&mut track.name)
+                                                .hint_text("(Track name)")
+                                                .desired_width(128.0),
+                                        );
 
-                                ui.horizontal(|ui| {
-                                    let gain = ui.add_sized(
-                                        [28.0, 112.0],
-                                        egui::Slider::new(&mut track.gain_db, -60.0..=40.0)
-                                            .vertical()
-                                            .show_value(false),
-                                    );
+                                        let name_chars = track.name.chars().count();
 
-                                    if gain.changed() {
-                                        if let Some(mixer) = mixer {
-                                            mixer.set_track_gain_db(
-                                                track.audio_index,
-                                                track.gain_db,
-                                            );
+                                        if name_response.has_focus() || name_chars > 64 {
+                                            let count_text = format!("{name_chars}/64");
+
+                                            if name_chars > 64 {
+                                                ui.colored_label(egui::Color32::YELLOW, count_text);
+                                            } else {
+                                                ui.small(count_text);
+                                            }
+                                        } else {
+                                            ui.add_space(14.0);
                                         }
-                                    }
 
-                                    ui.add_space(6.0);
+                                        let enabled = ui.checkbox(&mut track.enabled, "Enabled");
 
-                                    draw_dual_db_meters(
-                                        ui,
-                                        pre_peak_db,
-                                        post_peak_db,
-                                        track.enabled,
-                                    );
+                                        if enabled.changed() {
+                                            if let Some(mixer) = mixer {
+                                                mixer.set_track_enabled(
+                                                    track.audio_index,
+                                                    track.enabled,
+                                                );
+                                            }
+                                        }
+
+                                        ui.add_space(4.0);
+                                        ui.small("Fader     Pre  Post");
+
+                                        ui.horizontal(|ui| {
+                                            let gain = ui.add_sized(
+                                                [28.0, 112.0],
+                                                egui::Slider::new(&mut track.gain_db, -60.0..=40.0)
+                                                    .vertical()
+                                                    .show_value(false),
+                                            );
+
+                                            if gain.changed() {
+                                                if let Some(mixer) = mixer {
+                                                    mixer.set_track_gain_db(
+                                                        track.audio_index,
+                                                        track.gain_db,
+                                                    );
+                                                }
+                                            }
+
+                                            ui.add_space(6.0);
+
+                                            draw_dual_db_meters(
+                                                ui,
+                                                pre_peak_db,
+                                                post_peak_db,
+                                                track.enabled,
+                                            );
+                                        });
+
+                                        ui.label(format!("{:+.1} dB", track.gain_db));
+                                        ui.small(format!("Pre  {:>5.1} dB", pre_peak_db));
+                                        ui.small(format!("Post {:>5.1} dB", post_peak_db));
+
+                                        ui.add_space(3.0);
+
+                                        if ui
+                                            .add_enabled(
+                                                self.export_receiver.is_none(),
+                                                egui::Button::new("Export WAV"),
+                                            )
+                                            .clicked()
+                                        {
+                                            export_track_requested = Some(track_index);
+                                        }
+
+                                        ui.small(format!(
+                                            "{} / {} Hz / #{}",
+                                            track.codec.to_uppercase(),
+                                            track.sample_rate.unwrap_or(0),
+                                            track.stream_index
+                                        ));
+                                    });
                                 });
 
-                                ui.label(format!("{:+.1} dB", track.gain_db));
-                                ui.small(format!("Pre  {:>5.1} dB", pre_peak_db));
-                                ui.small(format!("Post {:>5.1} dB", post_peak_db));
-
-                                ui.add_space(3.0);
-
-                                if ui
-                                    .add_enabled(
-                                        self.export_receiver.is_none(),
-                                        egui::Button::new("Export WAV"),
-                                    )
-                                    .clicked()
-                                {
-                                    export_track_requested = Some(track_index);
-                                }
-
-                                ui.small(format!(
-                                    "{} / {} Hz / #{}",
-                                    track.codec.to_uppercase(),
-                                    track.sample_rate.unwrap_or(0),
-                                    track.stream_index
-                                ));
-                            });
-                        });
-
-                        ui.add_space(5.0);
-                    }
-
-                    // MASTER uses the same visual language as a normal track.
-                    ui.group(|ui| {
-                        ui.set_min_width(150.0);
-                        ui.set_max_width(150.0);
-
-                        ui.vertical_centered(|ui| {
-                            ui.strong("MASTER");
-
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.master_name)
-                                    .hint_text("Master_Mix")
-                                    .desired_width(128.0),
-                            );
-
-                            ui.add_space(14.0);
-
-                            ui.add_sized(
-                                [128.0, ui.spacing().interact_size.y],
-                                egui::Label::new("Output Bus"),
-                            );
-
-                            ui.add_space(4.0);
-                            ui.small("Fader     Pre  Post");
-
-                            ui.horizontal(|ui| {
-                                let gain = ui.add_sized(
-                                    [28.0, 112.0],
-                                    egui::Slider::new(&mut self.master_gain_db, -60.0..=40.0)
-                                        .vertical()
-                                        .show_value(false),
-                                );
-
-                                if gain.changed() {
-                                    if let Some(mixer) = mixer {
-                                        mixer.set_master_gain_db(self.master_gain_db);
-                                    }
-                                }
-
-                                ui.add_space(6.0);
-
-                                draw_dual_db_meters(
-                                    ui,
-                                    master_pre_peak_db,
-                                    master_post_peak_db,
-                                    true,
-                                );
-                            });
-
-                            ui.label(format!("{:+.1} dB", self.master_gain_db));
-                            ui.small(format!("Pre  {:>5.1} dB", master_pre_peak_db));
-                            ui.small(format!("Post {:>5.1} dB", master_post_peak_db));
-
-                            ui.add_space(3.0);
-
-                            if ui
-                                .add_enabled(
-                                    self.export_receiver.is_none(),
-                                    egui::Button::new("Export Mix"),
-                                )
-                                .clicked()
-                            {
-                                export_mix_requested = true;
+                                ui.add_space(5.0);
                             }
 
-                            ui.small("Final output bus");
+                            // MASTER uses the same visual language as a normal track.
+                            ui.group(|ui| {
+                                ui.set_min_width(150.0);
+                                ui.set_max_width(150.0);
+
+                                ui.vertical_centered(|ui| {
+                                    ui.strong("MASTER");
+
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.master_name)
+                                            .hint_text("Master_Mix")
+                                            .desired_width(128.0),
+                                    );
+
+                                    ui.add_space(14.0);
+
+                                    ui.add_sized(
+                                        [128.0, ui.spacing().interact_size.y],
+                                        egui::Label::new("Output Bus"),
+                                    );
+
+                                    ui.add_space(4.0);
+                                    ui.small("Fader     Pre  Post");
+
+                                    ui.horizontal(|ui| {
+                                        let gain = ui.add_sized(
+                                            [28.0, 112.0],
+                                            egui::Slider::new(
+                                                &mut self.master_gain_db,
+                                                -60.0..=40.0,
+                                            )
+                                            .vertical()
+                                            .show_value(false),
+                                        );
+
+                                        if gain.changed() {
+                                            if let Some(mixer) = mixer {
+                                                mixer.set_master_gain_db(self.master_gain_db);
+                                            }
+                                        }
+
+                                        ui.add_space(6.0);
+
+                                        draw_dual_db_meters(
+                                            ui,
+                                            master_pre_peak_db,
+                                            master_post_peak_db,
+                                            true,
+                                        );
+                                    });
+
+                                    ui.label(format!("{:+.1} dB", self.master_gain_db));
+                                    ui.small(format!("Pre  {:>5.1} dB", master_pre_peak_db));
+                                    ui.small(format!("Post {:>5.1} dB", master_post_peak_db));
+
+                                    ui.add_space(3.0);
+
+                                    if ui
+                                        .add_enabled(
+                                            self.export_receiver.is_none(),
+                                            egui::Button::new("Export Mix"),
+                                        )
+                                        .clicked()
+                                    {
+                                        export_mix_requested = true;
+                                    }
+
+                                    ui.small("Final output bus");
+                                });
+                            });
                         });
                     });
-                });
             });
 
         if let Some(track_index) = export_track_requested {
@@ -1517,6 +1825,12 @@ impl eframe::App for SimpleMkvPlayer {
 
         if export_video_mix_requested {
             self.export_video_with_mix();
+        }
+    }
+
+    fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
+        if let (Some(surface), Some(gl)) = (&self.video_surface, gl) {
+            surface.destroy(gl);
         }
     }
 }
