@@ -21,6 +21,10 @@ A typical OBS recording might contain:
 
 With Simple MKV Player, you can mute the full mix, enable the game and mic tracks, adjust them independently, and hear the result immediately without modifying the original recording.
 
+<p align="center">
+  <img src="src/assets/Simple_MKV_Example.jpg" alt="Simple MKV Player interface" width="900">
+</p>
+
 ## Features
 
 - Embedded MKV/video playback
