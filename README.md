@@ -6,12 +6,12 @@
 <h1 align="center">Simple MKV Player</h1>
 
 <p align="center">
-  A lightweight Windows video player and audio exporter for multi-track recordings.
+  <i>A lightweight Windows video player and audio exporter for multi-track recordings.</i>
 </p>
 
 Simple MKV Player is a lightweight Windows video player and audio exporter built for videos that contain multiple embedded audio tracks, especially OBS recordings.
 
-Most video players make you choose one audio track at a time. Simple MKV Player lets you play the video while monitoring and mixing multiple tracks simultaneously, while also letting you immediately isolate and export individual audio streams.
+Most video players make you choose one audio track at a time. Simple MKV Player lets you play the video while monitoring and mixing multiple tracks simultaneously, while also letting you immediately isolate and export individual audio streams for further editing elsewhere.
 
 A typical OBS recording might contain:
 
@@ -74,8 +74,7 @@ For the portable version:
 Simple MKV Player.exe
 ```
 
-No separate installation of FFmpeg, ffprobe, mpv, or Rust is required for either
-release type.
+A dedicated windows shortcut will allow use of the player with no installation needed
 
 ## Exporting
 
