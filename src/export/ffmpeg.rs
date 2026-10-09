@@ -1,3 +1,5 @@
+use crate::runtime::{ffmpeg_path, hide_child_console};
+
 use std::{
     io::{BufRead, BufReader},
     path::Path,
@@ -24,7 +26,8 @@ where
 {
     let gain = db_to_linear(gain_db.clamp(-60.0, 40.0));
 
-    let mut command = Command::new("ffmpeg");
+    let mut command = Command::new(ffmpeg_path());
+    hide_child_console(&mut command);
 
     command
         .arg("-nostdin")
@@ -75,7 +78,8 @@ where
 
     let filter = build_mix_filter(tracks, master_gain_db);
 
-    let mut command = Command::new("ffmpeg");
+    let mut command = Command::new(ffmpeg_path());
+    hide_child_console(&mut command);
 
     command
         .arg("-nostdin")
@@ -130,7 +134,8 @@ where
 
     let filter = build_mix_filter(tracks, master_gain_db);
 
-    let mut command = Command::new("ffmpeg");
+    let mut command = Command::new(ffmpeg_path());
+    hide_child_console(&mut command);
 
     command
         .arg("-nostdin")

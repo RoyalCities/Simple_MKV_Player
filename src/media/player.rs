@@ -1,7 +1,9 @@
+use crate::runtime::libmpv_path;
+
 use libloading::Library;
 use std::{
     ffi::{CStr, CString, c_char, c_int, c_void},
-    path::{Path, PathBuf},
+    path::Path,
     ptr,
     sync::Arc,
 };
@@ -537,17 +539,8 @@ impl MpvPlayer {
         error_string(api.error_string, code)
     }
 
-    fn dll_path() -> Result<PathBuf, String> {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("vendor")
-            .join("mpv")
-            .join("libmpv-2.dll");
-
-        if !path.exists() {
-            return Err(format!("Vendored libmpv DLL not found: {}", path.display()));
-        }
-
-        Ok(path)
+    fn dll_path() -> Result<std::path::PathBuf, String> {
+        libmpv_path()
     }
 }
 

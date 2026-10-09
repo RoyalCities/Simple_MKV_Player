@@ -1,6 +1,9 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod app;
 mod export;
 mod media;
+mod runtime;
 
 use app::SimpleMkvPlayer;
 use eframe::egui;

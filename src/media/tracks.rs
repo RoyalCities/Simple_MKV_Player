@@ -1,3 +1,5 @@
+use crate::runtime::{ffprobe_path, hide_child_console};
+
 use serde::Deserialize;
 use std::{collections::HashMap, path::Path, process::Command};
 
@@ -35,7 +37,10 @@ struct ProbeStream {
 }
 
 pub fn probe_audio_tracks(path: &Path) -> Result<Vec<DetectedAudioTrack>, String> {
-    let output = Command::new("ffprobe")
+    let mut command = Command::new(ffprobe_path());
+    hide_child_console(&mut command);
+
+    let output = command
         .arg("-v")
         .arg("error")
         .arg("-select_streams")

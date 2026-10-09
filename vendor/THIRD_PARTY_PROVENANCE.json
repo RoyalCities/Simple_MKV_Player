@@ -1,0 +1,30 @@
+﻿{
+    "schema_version":  2,
+    "generated_utc":  "2026-10-09T01:07:58.1575074Z",
+    "ffmpeg":  {
+                   "project":  "FFmpeg",
+                   "builder":  "System233/ffmpeg-msvc-prebuilt",
+                   "release_tag":  "n7.1-241205",
+                   "archive":  "ffmpeg-n7.1-241205-lgpl-amd64-static.zip",
+                   "checksum_asset":  "ffmpeg-n7.1-241205-lgpl-amd64-static.sha1",
+                   "published_sha1":  "875f51047ef9bd6976166677233e53e7ca474edf",
+                   "archive_sha256":  "ad955763ac2a076c251ac51e2414c6432f5a5eafe751745ac7eef335b53f6e5f",
+                   "source":  "https://github.com/FFmpeg/FFmpeg"
+               },
+    "libmpv":  {
+                   "project":  "mpv/libmpv",
+                   "builder":  "zhongfly/mpv-winbuild",
+                   "build_tag":  "2026-10-04-413ff0b1cd",
+                   "build_action":  "https://github.com/zhongfly/mpv-winbuild/actions/runs/37200648248",
+                   "build_repository_commit":  "88bdc4d",
+                   "mpv_commit":  "413ff0b1cd4585294803308a1a14be2fad30cede",
+                   "archive":  "mpv-dev-lgpl-x86_64-20261004-git-413ff0b1cd.7z",
+                   "archive_sha256":  "5327f63b40459bba61d3985bca80a24674844fa8203e44f74db9e54854d7f501",
+                   "source":  "https://github.com/mpv-player/mpv/tree/413ff0b1cd4585294803308a1a14be2fad30cede"
+               },
+    "installed_files":  {
+                            "vendor\\ffmpeg\\ffmpeg.exe":  "0183bd665a7cdb7eb9f72d0805af570440d373a847403d0eaf84c1d9db1dbba2",
+                            "vendor\\ffmpeg\\ffprobe.exe":  "78eabc70cde11c4953367589f657f2c5031e2c7b5563ad9d2363c5f94febb29e",
+                            "vendor\\mpv\\libmpv-2.dll":  "41b3df33467e16ab04449bd0a136ac594ec6efb0b0642c32486f80b6307fcd5a"
+                        }
+}

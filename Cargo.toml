@@ -2,6 +2,8 @@
 name = "simple_mkv_player"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "A Windows video player and multi-track audio mixer for MKV and OBS recordings."
 
 [dependencies]
 cpal = "0.16"

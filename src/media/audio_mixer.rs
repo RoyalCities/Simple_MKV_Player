@@ -1,3 +1,5 @@
+use crate::runtime::{ffmpeg_path, hide_child_console};
+
 use cpal::{
     SampleFormat, Stream,
     traits::{DeviceTrait, HostTrait, StreamTrait},
@@ -321,7 +323,10 @@ impl AudioMixer {
 
         let start = start_seconds.max(0.0).to_string();
 
-        let mut child = Command::new("ffmpeg")
+        let mut command = Command::new(ffmpeg_path());
+        hide_child_console(&mut command);
+
+        let mut child = command
             .arg("-nostdin")
             .arg("-hide_banner")
             .arg("-loglevel")
